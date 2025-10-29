@@ -4,11 +4,11 @@
 # 1. Python 版本: 此脚本建议使用 Python 3.8.x 版本运行
 # 2. 安装依赖库: pip install requests pysocks certifi futures
 # -----------------------------------
-# (修改) Sing-box 真人测速说明
-# 1. 核心文件: 要使用 "Sing-box 真人测速"，必须下载 Sing-box 核心。
+# (修改) Sing-box 连接测速说明
+# 1. 核心文件: 要使用 "Sing-box 连接测速"，必须下载 Sing-box 核心。
 #    - Windows: 下载 suitable zip, 解压，将 `sing-box.exe` 放在本脚本同目录。
 #    - macOS/Linux: 将 `sing-box` 可执行文件放在本脚本同目录。
-# 2. 测试目标: 默认 'http://www.msftconnecttest.com/connecttest.txt'
+# 2. 测试目标: 默认 'https://cp.cloudflare.com/'
 # 3. !!! 重要: 必须将 sing-box.exe 和本程序添加到杀毒软件/防火墙白名单 !!!
 # -----------------------------------
 
@@ -87,9 +87,9 @@ class TextWidgetContextMenu:
     def paste(self): self.widget.event_generate("<<Paste>>")
     def select_all(self):
         # 处理不同控件类型的全选
-        if hasattr(self.widget, 'select_range'): # Entry 控件
+        if hasattr(self, 'select_range'): # Entry 控件
              self.widget.select_range(0, tk.END)
-        elif hasattr(self.widget, 'tag_add'): # Text/ScrolledText 控件
+        elif hasattr(self, 'tag_add'): # Text/ScrolledText 控件
              # 需要检查控件是否为空，否则 tag_add 会报错
              try:
                  # 检查控件是否存在并且有内容
@@ -333,7 +333,8 @@ class DynamicSubscriptionFinder:
                  url_name = future_to_url.get(future, "未知URL")
                  self._log(f"一个文件提取任务失败 ({url_name[:50]}...): {e}")
 
-# --- (v6.1.10) 后端处理核心 (集成测速) ---
+# --- (v6.1.14) 后端处理核心 (集成测速) ---
+# (v6.1.14) 修复 gRPC transport 的 service_name 映射错误
 class RealProxyAggregator:
     # (修改) Sing-box 核心可执行文件名
     SINGBOX_EXECUTABLE = "sing-box.exe" if platform.system() == "Windows" else "sing-box"
@@ -361,7 +362,7 @@ class RealProxyAggregator:
         self.singbox_exists = os.path.isfile(self.singbox_path)
         
         if not self.singbox_exists:
-             self._log(f"警告：未在 '{base_path}' 目录找到 {self.SINGBOX_EXECUTABLE}。'Sing-box 真人测速' 功能将不可用。")
+             self._log(f"警告：未在 '{base_path}' 目录找到 {self.SINGBOX_EXECUTABLE}。'Sing-box 连接测速' 功能将不可用。")
 
     def _log(self, msg): self.gui_queue.put(('log', msg))
 
@@ -437,7 +438,7 @@ class RealProxyAggregator:
 
     @staticmethod
     def _parse_node_link_for_tcp(link):
-        """专用于 TCP Ping 的解析器"""
+        """专用于 TCP Ping 的解析器 (保持不变)"""
         try:
             if link.startswith("vmess://"):
                 try:
@@ -515,360 +516,490 @@ class RealProxyAggregator:
         except Exception:
             return None 
 
-    # --- (重构) Sing-box 解析器 ---
-    
-    # (新增) 内部辅助函数：检查 IP 地址
-    @staticmethod
-    def _is_ip_address(s):
-        """辅助函数: 检查字符串是否为 IP 地址 (v4 or v6)"""
-        if not s: return False
-        # 检查 IPv4
-        if '.' in s:
-            try:
-                socket.inet_pton(socket.AF_INET, s)
-                return True
-            except socket.error:
-                pass
-        # 检查 IPv6 (需要包含 ':')
-        if ':' in s:
-            try:
-                # 移除潜在的方括号
-                s_no_brackets = s.strip('[]')
-                socket.inet_pton(socket.AF_INET6, s_no_brackets)
-                return True
-            except socket.error:
-                pass
-        return False
+    # --- (v6.1.13) JS 移植解析器 ---
 
-    # (新增) Vmess 解析器
-    @staticmethod
-    def _parse_singbox_vmess(link, params, fragment):
+    def _base64_decode_safe(self, s):
+        """安全的 Base64 解码 (URL-safe, 忽略 UTF-8 错误)"""
         try:
-            b64_part = link[8:]
-            b64_part += '=' * (-len(b64_part) % 4)
-            config = json.loads(base64.b64decode(b64_part).decode('utf-8', errors='ignore'))
-        except Exception: 
-            return None # Vmess 格式无效
+            s = s.replace('-', '+').replace('_', '/')
+            s += '=' * (-len(s) % 4)
+            decoded_bytes = base64.urlsafe_b64decode(s)
+            return decoded_bytes.decode('utf-8', errors='ignore')
+        except Exception as e:
+            # self._log(f"[Base64 解码失败]: {e}")
+            return None
 
-        outbound = {
-            "type": "vmess",
-            "tag": fragment or f"vmess_{config.get('add', '')}_{config.get('port', 443)}",
-            "server": config.get("add", ""),
-            "server_port": int(config.get("port", 443)),
-            "uuid": config.get("id", ""),
-            "security": config.get("scy", "auto"),
-            "alter_id": int(config.get("aid", 0)),
-        }
-        if params.get("packetEncoding"):
-            outbound["packet_encoding"] = params.get("packetEncoding")
-
-        net = config.get("net", "tcp")
-        tls_enabled = config.get("tls", "none") == "tls"
-        
-        if tls_enabled:
-            tls_config = {"enabled": True}
-            server_name = config.get("sni", config.get("host", ""))
-            tls_config["insecure"] = params.get("allowInsecure") == "1"
-            if server_name and not RealProxyAggregator._is_ip_address(server_name):
-                 tls_config["server_name"] = server_name
-            
-            alpn_str = params.get("alpn")
-            if alpn_str:
-                 tls_config["alpn"] = [s.strip() for s in alpn_str.split(',')]
-            
-            outbound["tls"] = tls_config
-
-        if net == "ws":
-            outbound["transport"] = {
-                "type": "ws",
-                "path": config.get("path", "/"),
-                "headers": {"Host": config.get("host", config.get("add", ""))}
-            }
-        elif net == "grpc":
-            outbound["transport"] = {
-                "type": "grpc",
-                "service_name": config.get("path", "")
-            }
-        return outbound
-
-    # (新增) Vless/Trojan 解析器
-    @staticmethod
-    def _parse_singbox_vless_trojan(parsed_url, params, fragment):
-        protocol = parsed_url.scheme
-        hostname = parsed_url.hostname 
-        port = parsed_url.port
-        
-        outbound = {
-            "type": protocol,
-            "tag": fragment or f"{protocol}_{hostname}_{port}",
-            "server": hostname,
-            "server_port": port,
-        }
-        
-        if protocol == "vless":
-            outbound["uuid"] = parsed_url.username
-            if params.get("flow"): 
-                outbound["flow"] = params.get("flow") 
-        else: # trojan
-            outbound["password"] = parsed_url.username
-
-        security_type = params.get("security", "none") 
-        tls_config = None 
-        
-        is_tls_enabled = False
-        if protocol == "vless" and security_type in ("tls", "xtls", "reality"):
-            is_tls_enabled = True
-        elif protocol == "trojan" and security_type != "none": 
-            is_tls_enabled = True
-
-        if is_tls_enabled:
-            tls_config = {"enabled": True}
-            tls_config["insecure"] = params.get("allowInsecure") == "1" 
-            
-            sni = params.get("sni")
-            server_name_to_use = None
-            
-            if sni and not RealProxyAggregator._is_ip_address(sni):
-                server_name_to_use = sni
-            elif not sni and hostname and not RealProxyAggregator._is_ip_address(hostname):
-                 server_name_to_use = hostname
-            
-            if server_name_to_use:
-                tls_config["server_name"] = server_name_to_use
-
-            alpn_str = params.get("alpn")
-            if alpn_str:
-                 tls_config["alpn"] = [s.strip() for s in alpn_str.split(',')]
-
-            if protocol == "vless" and security_type == "reality":
-                tls_config["reality"] = {"enabled": True}
-                if params.get("pbk"): tls_config["reality"]["public_key"] = params.get("pbk")
-                if params.get("sid"): tls_config["reality"]["short_id"] = params.get("sid")
+    def _parse_url_to_generic_object(self, link):
+        """
+        (v6.1.13) 移植自 JS parseUrl 函数
+        将节点 URL 转换为通用的 Python 字典。
+        """
+        try:
+            # 1. VMESS
+            if link.startswith('vmess://'):
+                base64_str = link[8:].strip()
+                decoded = self._base64_decode_safe(base64_str)
+                if not decoded:
+                    raise ValueError("VMess base64 解码失败")
                 
-            utls_fp = params.get("fp")
-            if utls_fp:
-                 tls_config["utls"] = {"enabled": True, "fingerprint": utls_fp}
+                vmess_obj = json.loads(decoded)
+                vmess_obj['type'] = 'vmess' # 添加 'type' 键以统一
+                
+                # (v6.1.16) 将查询参数也添加到 vmess 对象中，以处理 allowInsecure
+                try:
+                    # 尝试从原始链接解析查询参数
+                    parsed_vmess_url = urllib.parse.urlparse(link)
+                    vmess_obj['params'] = dict(urllib.parse.parse_qsl(parsed_vmess_url.query))
+                except Exception:
+                    vmess_obj['params'] = {} # 如果解析失败，则设置为空字典
+                    
+                return vmess_obj
 
-            if tls_config:
-                outbound["tls"] = tls_config
+            # 2. HYSTERIA2 / HY2
+            if link.startswith(('hysteria2://', 'hy2://')):
+                # 确保 hy2:// 也能被正确解析
+                if link.startswith('hy2://'):
+                    link = 'hysteria2://' + link[5:]
+                    
+                parsed_url = urllib.parse.urlparse(link)
+                params = dict(urllib.parse.parse_qsl(parsed_url.query))
+                
+                tag = ""
+                try:
+                    tag = urllib.parse.unquote(parsed_url.fragment or '')
+                except Exception:
+                    tag = parsed_url.fragment or ''
+                
+                if not tag:
+                    tag = parsed_url.hostname
+                
+                # 移植 JS `parseUrl` 的返回结构
+                return {
+                    'type': 'hysteria2',
+                    'server': parsed_url.hostname,
+                    'port': int(parsed_url.port or 443),
+                    'password': parsed_url.username,
+                    'tag': tag,
+                    'insecure': params.get('insecure') == '1',
+                    'sni': params.get('sni'),
+                    'obfs': params.get('obfs'),
+                    'up': params.get('up'),
+                    'down': params.get('down'),
+                    'alpn': params.get('alpn'),
+                    'pinSHA256': params.get('pinSHA256'),
+                    'ca': params.get('ca'),
+                    'params': params # 保留所有参数
+                }
 
-        transport_type = params.get("type", "tcp")
-        if transport_type == "ws":
-            outbound["transport"] = {
-                "type": "ws",
-                "path": params.get("path", "/"),
-                "headers": {"Host": params.get("host", hostname)}
-            }
-        elif transport_type == "grpc":
-            outbound["transport"] = {
-                "type": "grpc",
-                "service_name": params.get("serviceName", "") 
-            }
-        return outbound
+            # 3. VLESS / TROJAN
+            if link.startswith(('vless://', 'trojan://')):
+                parsed_url = urllib.parse.urlparse(link)
+                protocol = parsed_url.scheme
+                
+                uuid_or_pass = parsed_url.username
+                if protocol == 'vless' and not uuid_or_pass:
+                    raise ValueError("VLESS UUID 不能为空")
 
-    # (新增) Shadowsocks 解析器
-    @staticmethod
-    def _parse_singbox_ss(parsed_url, params, fragment):
-        method, password, address, port = None, None, None, None
+                server = parsed_url.hostname
+                port = parsed_url.port
+                params = dict(urllib.parse.parse_qsl(parsed_url.query))
+                
+                # 移植 JS 的 tag (fragment) 解码逻辑
+                tag = ""
+                try:
+                    tag = urllib.parse.unquote(parsed_url.fragment or '')
+                except Exception:
+                    tag = parsed_url.fragment or ''
+                if not tag:
+                    tag = server
+
+                # 移植 JS 的 path 逻辑: 优先 query params, 其次 pathname
+                path = params.get('path', parsed_url.path or '/')
+                if path == '/':
+                    path = '' # 匹配 JS 逻辑 `(path === '/' ? '' : path)`
+
+                # 移植 JS 的 port 逻辑
+                if not port:
+                    port = 443 if params.get('security') == 'tls' else 80
+                
+                return {
+                    'type': protocol,
+                    'uuid': uuid_or_pass if protocol == 'vless' else None,
+                    'password': uuid_or_pass if protocol == 'trojan' else None,
+                    'server': server,
+                    'port': int(port),
+                    'path': path, # Store the potentially empty path
+                    'params': params,
+                    'tag': tag
+                }
+            
+            # 4. SS (Shadowsocks) - 移植 JS 逻辑是困难的，保持原有逻辑
+            if link.startswith('ss://'):
+                # SS 解析器逻辑相对简单，v6.1.12 的已足够健壮
+                # 此处 *不* 移植 JS 的 SS 解析器，因为它未包含在用户提供的 JS 中
+                # 我们将直接在 _parse_node_link_for_singbox 中处理 SS
+                return {'type': 'shadowsocks_special', 'link': link} # 特殊标记
+
+        except Exception as e:
+            # self._log(f"[解析器] _parse_url_to_generic_object 失败: {e} -> {link[:30]}")
+            return None
+        return None
+
+    def _parse_node_link_for_singbox(self, link):
+        """
+        (v6.1.14) 移植自 JS convertNodes 函数 + gRPC fix
+        将通用字典转换为 Sing-box 出站配置。
+        """
         
-        if '@' in parsed_url.netloc and ':' in parsed_url.netloc.split('@', 1)[1]:
-            user_info_b64, host_port = parsed_url.netloc.split('@', 1)
-            host, port_str = host_port.rsplit(':', 1)
-            address = host.strip('[]')
-            port = int(port_str)
-            try:
-                user_info_b64 += '=' * (-len(user_info_b64) % 4)
-                decoded_user = base64.urlsafe_b64decode(user_info_b64).decode('utf-8', errors='ignore')
-                method, password = decoded_user.split(':', 1)
-            except Exception: return None
+        # 步骤 1: 将 URL 转换为通用字典
+        # (注意: SS 协议在此处被特殊处理)
+        parsed = self._parse_url_to_generic_object(link)
 
-        elif parsed_url.username and parsed_url.password and parsed_url.hostname and parsed_url.port:
-             method = urllib.parse.unquote(parsed_url.username)
-             password = urllib.parse.unquote(parsed_url.password)
-             address = parsed_url.hostname
-             port = parsed_url.port
+        if not parsed:
+             # SSR 协议在此处被捕获并返回 None
+            if link.startswith("ssr://"):
+                return None
+            # self._log(f"[解析器] 步骤 1 失败: {link[:30]}")
+            return None
 
-        elif not parsed_url.path and '@' not in parsed_url.netloc and ':' not in parsed_url.netloc:
-             try:
-                b64_part = parsed_url.netloc
-                b64_part += '=' * (-len(b64_part) % 4)
-                decoded_full = base64.urlsafe_b64decode(b64_part).decode('utf-8', errors='ignore')
-                user_pass, host_port = decoded_full.split('@', 1)
-                method, password = user_pass.split(':', 1)
-                address, port_str = host_port.rsplit(':', 1)
-                address = address.strip('[]')
-                port = int(port_str)
-             except Exception: return None
-        else: 
-            return None 
-
-        supported_methods = [
-            "aes-256-gcm", "aes-128-gcm", "chacha20-ietf-poly1305",
-            "2022-blake3-aes-128-gcm", "2022-blake3-aes-256-gcm",
-            "2022-blake3-chacha20-poly1305"
-        ]
-        method_lower = method.lower()
-        if method_lower == "chacha20-poly1305": method = "chacha20-ietf-poly1305"
-        if method not in supported_methods: return None 
-
-        outbound = {
-            "type": "shadowsocks",
-            "tag": fragment or f"ss_{address}_{port}",
-            "server": address,
-            "server_port": port,
-            "method": method,
-            "password": password
-        }
-
-        plugin_param = params.get("plugin")
-        if plugin_param:
-             try:
-                plugin_parts = plugin_param.split(';')
-                plugin_name = plugin_parts[0].lower().strip()
-                plugin_opts = {}
-                for part in plugin_parts[1:]:
-                    part = part.strip()
-                    if not part: continue
-                    if '=' in part:
-                        key, value = part.split('=', 1)
-                        plugin_opts[key.strip()] = value.strip()
-                    else:
-                         plugin_opts[part.strip()] = True 
-
-                if plugin_name == "v2ray-plugin" and plugin_opts.get("mode") == "websocket":
-                     ws_path = plugin_opts.get("path", "/")
-                     ws_host = plugin_opts.get("host", address)
-                     outbound["transport"] = {
-                         "type": "ws",
-                         "path": ws_path,
-                         "headers": {"Host": ws_host}
-                     }
-                     if plugin_opts.get("tls") is True or plugin_opts.get("tls", "").lower() == "true":
-                          tls_config = {"enabled": True}
-                          sni = ws_host
-                          if sni and not RealProxyAggregator._is_ip_address(sni):
-                               tls_config["server_name"] = sni
-                          tls_config["insecure"] = plugin_opts.get("insecure") is True or plugin_opts.get("insecure", "").lower() == "true"
-                          outbound["tls"] = tls_config
-             except Exception:
-                  pass # 忽略插件解析失败
-        return outbound
-
-    # (新增) Hysteria v1 解析器
-    @staticmethod
-    def _parse_singbox_hysteria(parsed_url, params, fragment):
-         hostname = parsed_url.hostname
-         port = parsed_url.port
-         auth = params.get("auth") or parsed_url.username or parsed_url.password
-         sni_host = params.get("peer") or hostname
-         insecure = params.get("insecure", "0") == "1"
-         up_mbps_str = params.get("upmbps", "10")
-         down_mbps_str = params.get("downmbps", "50")
-         recv_window_conn = params.get("recv_window_conn") 
-         recv_window = params.get("recv_window")        
-
-         if not auth: return None 
-
-         try:
-             up_mbps = int(up_mbps_str)
-             down_mbps = int(down_mbps_str)
-         except ValueError:
-             return None 
-
-         outbound = {
-             "type": "hysteria",
-             "tag": fragment or f"hy_{hostname}_{port}",
-             "server": hostname,
-             "server_port": port,
-             "up_mbps": up_mbps,
-             "down_mbps": down_mbps,
-             "auth_str": auth,
-             "tls": {
-                 "enabled": True, 
-                 "insecure": insecure,
-             }
-         }
-         if sni_host and not RealProxyAggregator._is_ip_address(sni_host):
-             outbound["tls"]["server_name"] = sni_host
-         if recv_window_conn:
-             try: outbound["recv_window_conn"] = int(recv_window_conn)
-             except ValueError: pass
-         if recv_window:
-             try: outbound["recv_window"] = int(recv_window)
-             except ValueError: pass
-         return outbound
-
-    # (新增) Hysteria v2 解析器
-    @staticmethod
-    def _parse_singbox_hysteria2(parsed_url, params, fragment):
-         hostname = parsed_url.hostname
-         port = parsed_url.port
-         password = parsed_url.username or parsed_url.password
-         sni_host = params.get("sni") or hostname
-         insecure = params.get("insecure", "0") == "1"
-
-         if not password: return None 
-
-         outbound = {
-             "type": "hysteria2",
-             "tag": fragment or f"hy2_{hostname}_{port}",
-             "server": hostname,
-             "server_port": port,
-             "password": password,
-             "tls": {
-                 "enabled": True, 
-                 "insecure": insecure,
-             }
-         }
-         if sni_host and not RealProxyAggregator._is_ip_address(sni_host):
-             outbound["tls"]["server_name"] = sni_host
-         return outbound
-
-    # (修改) 全新的 Sing-box 解析器 (v6.1.10 - 重构为调度器)
-    @staticmethod
-    def _parse_node_link_for_singbox(link):
-        """专用于 Sing-box 的全新高级解析器 (v6.1.10 - 调度器)"""
         try:
-            outbound = None
-            parsed_url = urllib.parse.urlparse(link)
-            # 使用 parse_qs 保留重复参数
-            params_list = urllib.parse.parse_qs(parsed_url.query)
-            # 将列表值转换为单个值（取第一个）
-            params = {k: v[0] for k, v in params_list.items()}
-            fragment = parsed_url.fragment # 用于 tag/name
-
-            if link.startswith("vmess://"):
-                outbound = RealProxyAggregator._parse_singbox_vmess(link, params, fragment)
+            # 步骤 2: 将通用字典 (parsed) 映射到 Sing-box 配置 (outbound)
+            # (移植自 JS convertNodes)
             
-            elif link.startswith(("vless://", "trojan://")):
-                outbound = RealProxyAggregator._parse_singbox_vless_trojan(parsed_url, params, fragment)
-
-            elif link.startswith("ss://"):
-                outbound = RealProxyAggregator._parse_singbox_ss(parsed_url, params, fragment)
-
-            elif link.startswith("hysteria://"):
-                outbound = RealProxyAggregator._parse_singbox_hysteria(parsed_url, params, fragment)
-
-            elif link.startswith(("hy2://", "hysteria2://")):
-                outbound = RealProxyAggregator._parse_singbox_hysteria2(parsed_url, params, fragment)
+            proto_type = parsed.get('type')
             
-            elif link.startswith("ssr://"):
-                return None # 显式跳过 SSR
+            # 2.0 (特殊处理) SS 协议
+            # SS 逻辑不包含在 JS 示例中, 我们使用 v6.1.12 中健壮的 SS 解析器
+            if proto_type == 'shadowsocks_special':
+                # 我们必须在这里重新解析 SS，因为 v6.1.12 的 SS 解析器是
+                # 一站式 (URL -> Sing-box)，而不是两步。
+                
+                # --- v6.1.12 SS 解析器开始 ---
+                parsed_url = urllib.parse.urlparse(link)
+                params_list = urllib.parse.parse_qs(parsed_url.query)
+                params = {k: v[0] for k, v in params_list.items()}
+                fragment = parsed_url.fragment
+                
+                method, password, address, port = None, None, None, None
+                
+                if '@' in parsed_url.netloc and ':' in parsed_url.netloc.split('@', 1)[1]:
+                    user_info_b64, host_port = parsed_url.netloc.split('@', 1)
+                    host, port_str = host_port.rsplit(':', 1)
+                    address = host.strip('[]')
+                    port = int(port_str)
+                    try:
+                        decoded_user = self._base64_decode_safe(user_info_b64)
+                        if not decoded_user: return None
+                        method, password = decoded_user.split(':', 1)
+                    except Exception: return None
 
-            if outbound: # 如果成功解析了任何支持的协议
-                # 确保 tag 存在
-                if not outbound.get("tag"):
-                     proto = outbound.get('type', 'unknown')
-                     serv = outbound.get('server', 'noserver')
-                     outbound["tag"] = f"{proto}_{serv}_{int(time.time()*1000)}"
+                elif parsed_url.username and parsed_url.password and parsed_url.hostname and parsed_url.port:
+                     method = urllib.parse.unquote(parsed_url.username)
+                     password = urllib.parse.unquote(parsed_url.password)
+                     address = parsed_url.hostname
+                     port = parsed_url.port
+
+                elif not parsed_url.path and '@' not in parsed_url.netloc and ':' not in parsed_url.netloc:
+                     try:
+                        b64_part = parsed_url.netloc
+                        decoded_full = self._base64_decode_safe(b64_part)
+                        if not decoded_full: return None
+                        user_pass, host_port = decoded_full.split('@', 1)
+                        method, password = user_pass.split(':', 1)
+                        address, port_str = host_port.rsplit(':', 1)
+                        address = address.strip('[]')
+                        port = int(port_str)
+                     except Exception: return None
+                else: 
+                    return None 
+
+                supported_methods = ["aes-256-gcm", "aes-128-gcm", "chacha20-ietf-poly1305", "2022-blake3-aes-128-gcm", "2022-blake3-aes-256-gcm", "2022-blake3-chacha20-poly1305"]
+                method_lower = method.lower()
+                if method_lower == "chacha20-poly1305": method = "chacha20-ietf-poly1305"
+                if method not in supported_methods: return None 
+
+                tag = (fragment or f"ss_{address}_{port}").replace(" ", "_") # 基础 tag
+
+                outbound = {
+                    "type": "shadowsocks",
+                    "tag": tag,
+                    "server": address,
+                    "server_port": port,
+                    "method": method,
+                    "password": password
+                }
+
+                plugin_param = params.get("plugin")
+                if plugin_param:
+                     try:
+                        plugin_parts = plugin_param.split(';')
+                        plugin_name = plugin_parts[0].lower().strip()
+                        plugin_opts = {}
+                        for part in plugin_parts[1:]:
+                            part = part.strip()
+                            if not part: continue
+                            if '=' in part:
+                                key, value = part.split('=', 1)
+                                plugin_opts[key.strip()] = value.strip()
+                            else:
+                                 plugin_opts[part.strip()] = True 
+
+                        if plugin_name == "v2ray-plugin" and plugin_opts.get("mode") == "websocket":
+                             ws_path = plugin_opts.get("path", "/")
+                             # (v6.1.13) 移植 JS 的 Host/SNI 逻辑 (host || server)
+                             ws_host = plugin_opts.get("host") or address
+                             
+                             outbound["transport"] = {
+                                 "type": "ws",
+                                 "path": ws_path,
+                                 "headers": {"Host": ws_host}
+                             }
+                             
+                             if plugin_opts.get("tls") is True or plugin_opts.get("tls", "").lower() == "true":
+                                  tls_config = {"enabled": True}
+                                  # SNI 应该跟随 WS Host
+                                  tls_config["server_name"] = ws_host
+                                  tls_config["insecure"] = plugin_opts.get("insecure") is True or plugin_opts.get("insecure", "").lower() == "true"
+                                  outbound["tls"] = tls_config
+                     except Exception:
+                          pass # 忽略插件解析失败
+                return outbound
+                # --- v6.1.12 SS 解析器结束 ---
+
+            # 清理 tag
+            raw_tag = str(parsed.get('tag') or parsed.get('ps') or parsed.get('server') or 'node')
+            tag = re.sub(r'[^a-zA-Z0-9.\-_]', '_', raw_tag) # 匹配 JS 逻辑
+
+            # 2.1 HYSTERIA2
+            if proto_type == 'hysteria2':
+                outbound = {
+                    "type": 'hysteria2',
+                    "tag": tag,
+                    "server": parsed['server'],
+                    "server_port": parsed['port'],
+                    "password": parsed['password']
+                }
+                
+                # TLS (移植 JS)
+                tls_config = {
+                    "enabled": True,
+                    "insecure": parsed.get('insecure', False),
+                    "server_name": parsed.get('sni'),
+                    "alpn": parsed.get('alpn').split(',') if parsed.get('alpn') else None,
+                    # "ca": base64.b64decode(parsed.get('ca')) if parsed.get('ca') else None, # Sing-box config doesn't directly support inline CA string like this
+                    "pin_sha256": parsed.get('pinSHA256')
+                }
+                # Remove None values from tls object
+                outbound["tls"] = {k: v for k, v in tls_config.items() if v is not None}
+                
+                # Obfs (移植 JS)
+                if parsed.get('obfs'):
+                    outbound["obfs"] = {
+                        "type": "salamander",
+                        "password": parsed['obfs']
+                    }
+                
+                # Bandwidth (移植 JS)
+                if parsed.get('up'):
+                    try: outbound["up_mbps"] = int(parsed['up'])
+                    except: pass
+                if parsed.get('down'):
+                    try: outbound["down_mbps"] = int(parsed['down'])
+                    except: pass
+                    
+                return outbound
+
+            # 2.2 VLESS
+            elif proto_type == 'vless':
+                params = parsed.get('params', {})
+                outbound = {
+                    "type": 'vless',
+                    "tag": tag,
+                    "server": parsed['server'],
+                    "server_port": parsed['port'],
+                    "uuid": parsed['uuid'],
+                    "flow": params.get('flow', '') # flow can be empty string
+                }
+                # Remove flow if it's empty or None, as Sing-box might not like an empty string
+                if not outbound["flow"]:
+                    del outbound["flow"]
+
+                # TLS (移植 JS)
+                tls_obj = {}
+                security = params.get('security')
+                if security == 'reality':
+                    tls_obj = {
+                        "enabled": True,
+                        "server_name": params.get('sni') or parsed['server'], # (核心) 移植 JS fallback
+                        "reality": {"enabled": True, "public_key": params.get('pbk'), "short_id": params.get('sid')},
+                    }
+                    if params.get('fp'):
+                        tls_obj["utls"] = {"enabled": True, "fingerprint": params.get('fp')}
+                elif security == 'tls':
+                    tls_obj = {
+                        "enabled": True,
+                        "server_name": params.get('sni') or params.get('host') or parsed['server'] # (核心) 移植 JS fallback
+                    }
+                
+                # Add allowInsecure if present
+                if params.get('allowInsecure') == '1' and tls_obj.get('enabled'):
+                    tls_obj['insecure'] = True
+
+                if tls_obj:
+                    outbound['tls'] = tls_obj
+                
+                # Transport (移植 JS)
+                # (核心) 移植 JS `headerType` 和 `type` 的逻辑
+                trans_type = params.get('headerType') or params.get('type') or 'tcp'
+                if trans_type != 'none' and trans_type != 'tcp':
+                    # (核心) 移植 JS `host` fallback
+                    host = params.get('host') or parsed['server']
+                    
+                    # (v6.1.14) Fix gRPC: use service_name instead of path
+                    if trans_type == 'grpc':
+                        service_name = params.get('serviceName') or parsed.get('path') # Use serviceName or fallback to path
+                        transport_obj = {
+                            "type": "grpc",
+                            "service_name": service_name
+                        }
+                    # Handle WS and potentially other types
+                    else:
+                        # Use the path determined by _parse_url_to_generic_object (which is '' or actual path)
+                        ws_path = parsed.get('path') if parsed.get('path') else '/' # Default to '/' if empty
+                        transport_obj = {
+                            "type": trans_type,
+                            "path": ws_path,
+                            "headers": {"Host": host}
+                        }
+                    outbound["transport"] = transport_obj
+                    
+                return outbound
+
+            # 2.3 TROJAN
+            elif proto_type == 'trojan':
+                params = parsed.get('params', {})
+                outbound = {
+                    "type": 'trojan',
+                    "tag": tag,
+                    "server": parsed['server'],
+                    "server_port": parsed['port'],
+                    "password": parsed['password']
+                }
+
+                # TLS (移植 JS)
+                tls_obj = {}
+                security = params.get('security')
+                if security == 'tls':
+                    tls_obj = {
+                        "enabled": True,
+                        "server_name": params.get('sni') or params.get('host') or parsed['server'] # (核心) 移植 JS fallback
+                    }
+                
+                # (v6.1.13) 保留 Python v6.1.12 的 443 自动 TLS
+                elif not security and parsed.get('port') in (443, 8443, 2053, 2083, 2087, 2096):
+                    tls_obj = {
+                        "enabled": True,
+                        "server_name": params.get('sni') or params.get('host') or parsed['server'] # (核心) 移植 JS fallback
+                    }
+                
+                # Add allowInsecure if present
+                if params.get('allowInsecure') == '1' and tls_obj.get('enabled'):
+                    tls_obj['insecure'] = True
+
+                if tls_obj:
+                    outbound['tls'] = tls_obj
+
+                # Transport (移植 JS)
+                trans_type = params.get('headerType') or params.get('type') or 'tcp'
+                if trans_type != 'none' and trans_type != 'tcp':
+                    # (核心) 移植 JS `host` fallback
+                    host = params.get('host') or parsed['server']
+                    
+                    # (v6.1.14) Fix gRPC: use service_name instead of path
+                    if trans_type == 'grpc':
+                        service_name = params.get('serviceName') or parsed.get('path') # Use serviceName or fallback to path
+                        transport_obj = {
+                            "type": "grpc",
+                            "service_name": service_name
+                        }
+                    # Handle WS and potentially other types
+                    else:
+                        # Use the path determined by _parse_url_to_generic_object (which is '' or actual path)
+                        ws_path = parsed.get('path') if parsed.get('path') else '/' # Default to '/' if empty
+                        transport_obj = {
+                            "type": trans_type,
+                            "path": ws_path,
+                            "headers": {"Host": host}
+                        }
+                    outbound["transport"] = transport_obj
+                
+                return outbound
+                
+            # 2.4 VMESS
+            elif proto_type == 'vmess':
+                # Safely get integer port
+                try:
+                    port_int = int(parsed['port'])
+                except (ValueError, TypeError):
+                    port_int = 0 # Or some default/error handling
+
+                outbound = {
+                    "type": 'vmess',
+                    "tag": tag,
+                    "server": parsed['add'],
+                    "server_port": port_int,
+                    "uuid": parsed['id'],
+                    "security": parsed.get('scy', 'auto'),
+                    "alter_id": int(parsed.get('aid', 0)) # Add alter_id if present
+                }
+
+                # TLS (移植 JS)
+                if parsed.get('tls') == 'tls':
+                    # (核心) 移植 JS `sni/host/add` fallback
+                    server_name = parsed.get('sni') or parsed.get('host') or parsed.get('add')
+                    tls_config = {
+                        "enabled": True,
+                        "server_name": server_name
+                    }
+                    # Add allowInsecure if present in vmess json 'allowInsecure' or query param 'allowInsecure'
+                    if parsed.get('allowInsecure', '0') == '1' or parsed.get('params', {}).get('allowInsecure') == '1':
+                         tls_config['insecure'] = True
+                    outbound['tls'] = tls_config
+                
+                # Transport (移植 JS)
+                trans_type = parsed.get('net', 'tcp')
+                if trans_type != 'tcp':
+                    # (核心) 移植 JS `host/add` fallback
+                    host = parsed.get('host') or parsed.get('add')
+                    
+                    # (v6.1.14) Fix gRPC: use service_name instead of path
+                    if trans_type == 'grpc':
+                        # Vmess JSON uses 'path' for serviceName
+                        service_name = parsed.get('path', '')
+                        transport_obj = {
+                            "type": "grpc",
+                            "service_name": service_name
+                        }
+                    # Handle WS and potentially other types
+                    else:
+                        # Vmess JSON uses 'path' directly
+                        ws_path = parsed.get('path', '/') # Default to '/' if not present or empty
+                        if not ws_path: # Ensure path is at least '/' for WS
+                            ws_path = '/'
+                        transport_obj = {
+                            "type": trans_type,
+                            "path": ws_path,
+                            "headers": {"Host": host}
+                        }
+                    outbound["transport"] = transport_obj
+                
                 return outbound
 
         except Exception as e:
-            # 记录详细的解析错误以供调试 (保持注释状态)
-            # traceback_str = traceback.format_exc() 
-            # self.gui_queue.put(('log', f"解析 {link[:30]}... 失败: {e}\n{traceback_str}"))
+            # self._log(f"[解析器] 步骤 2 失败: {e} -> {link[:30]}")
             return None
-        return None
+            
+        return None # 默认返回 None
 
 
     # (修改) 全新的 Sing-box 配置生成器
@@ -898,9 +1029,12 @@ class RealProxyAggregator:
     def _singbox_real_test(self, node_link, local_port, timeout, test_url):
         """Sing-box 真实延迟测试 (带详细诊断日志 v6.1.5)"""
         
+        # (v6.1.13) _parse_node_link_for_singbox 现在是实例方法
         node_details = self._parse_node_link_for_singbox(node_link)
+        
         if not node_details:
-            # 解析失败日志已在解析器中处理 (如果取消了注释)
+            # (v6.1.12) 为解析失败添加日志
+            self.gui_queue.put(('log', f"  [Sing-box 失败 {local_port}]: 节点解析失败 (不支持或格式错误) -> {node_link[:40]}..."))
             return float('inf') 
 
         config_str = self._generate_singbox_config(node_details, local_port)
@@ -916,10 +1050,9 @@ class RealProxyAggregator:
                 f.write(config_str)
 
             # (新增) 记录生成的 outbound 配置 (去除 tag 以减少噪音)
-            logged_details = node_details.copy()
-            logged_details.pop('tag', None)
-            # 尝试更简洁地记录配置
-            # self.gui_queue.put(('log', f"  [诊断 {local_port}]: Outbound: {json.dumps(logged_details)}"))
+            # logged_details = node_details.copy()
+            # logged_details.pop('tag', None)
+            # self.gui_queue.put(('log', f"  [诊断 {local_port}]: Outbound: {json.dumps(logged_details, ensure_ascii=False)}")) # ensure_ascii=False for debugging non-ascii chars
 
             startupinfo = None
             if platform.system() == "Windows":
@@ -951,11 +1084,15 @@ class RealProxyAggregator:
                  except Exception: pass
                  # 在 stderr 中尝试查找常见的配置错误
                  err_lower = stderr_output.lower()
-                 if "configuration error" in err_lower or \
+                 # (v6.1.14) 更精确地捕获 gRPC path 错误
+                 if ("outbounds[0].transport.path: json: unknown field" in stderr_output and '"type": "grpc"' in config_str) or \
+                    ("outbounds[0].transport.service_name: json: unknown field" in stderr_output and '"type": "ws"' in config_str):
+                      error_msg = f"配置错误 (gRPC/WS 传输参数映射错误)"
+                 elif "configuration error" in err_lower or \
                     "decode config" in err_lower or \
                     "failed to create outbound" in err_lower or \
                     "failed to parse config" in err_lower:
-                      error_msg = f"配置错误"
+                      error_msg = f"配置错误 (解析器生成了无效配置)" # (v6.1.12) 明确指出解析器问题
                  elif "fatal" in err_lower: # 捕获其他致命错误
                       error_msg = f"启动时发生严重错误"
                  else:
@@ -998,6 +1135,9 @@ class RealProxyAggregator:
              if response_text:
                   # 清理HTML标签以便阅读
                   clean_text = re.sub('<[^<]+?>', '', response_text).strip()
+                  # (v6.1.12) 针对 400 错误添加特定诊断
+                  if status_code == 400 and "plain HTTP request" in response_text:
+                       clean_text = "明文 HTTP 请求发送到 HTTPS 端口 (TLS 解析错误)"
                   error_details += f" (内容: {clean_text}...)"
 
              self.gui_queue.put(('log', f"  [Sing-box 失败 {local_port}]: {error_details} -> {node_link[:40]}..."))
@@ -1007,8 +1147,19 @@ class RealProxyAggregator:
             self.gui_queue.put(('log', f"  [Sing-box 失败 {local_port}]: 本地代理错误 (杀毒软件/防火墙?) -> {node_link[:40]}... ({e})"))
             return float('inf') 
         except requests.exceptions.ConnectionError as e:
-            # 这表示通过代理连接错误 (节点可能已失效)
-            self.gui_queue.put(('log', f"  [Sing-box 失败 {local_port}]: 远端连接错误 -> {node_link[:40]}... ({e})"))
+            # (v6.1.11) 捕获 General SOCKS server failure
+            # 这表示通过代理连接错误 (节点可能已失效, 或解析配置错误)
+            error_msg = f"{e}"
+            if "0x01: General SOCKS server failure" in error_msg:
+                 error_msg = "远端连接错误 (SOCKS 0x01: 解析配置错误或节点失效)"
+            elif "Remote end closed connection without response" in error_msg:
+                 error_msg = "远端连接错误 (服务器无响应关闭)"
+            # (v6.1.15) 捕获 ConnectTimeoutError
+            elif "ConnectTimeoutError" in str(type(e)) or "timed out" in error_msg:
+                 error_msg = f"远端连接错误 (连接超时 >{timeout}s)"
+            else:
+                 error_msg = f"远端连接错误 -> ({e})" # 简化日志
+            self.gui_queue.put(('log', f"  [Sing-box 失败 {local_port}]: {error_msg} -> {node_link[:40]}..."))
             return float('inf') 
         except requests.exceptions.Timeout:
             self.gui_queue.put(('log', f"  [Sing-box 失败 {local_port}]: 超时 -> {node_link[:40]}..."))
@@ -1039,7 +1190,7 @@ class RealProxyAggregator:
 class AggregatorApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("代理聚合器 v6.1.10 (代码重构)") # (修改) 标题
+        self.root.title("代理聚合器 v6.1.16 (默认值调整)") # (修改) 标题
         self.root.geometry("850x980") 
         
         self.internal_github_token = "github_pat_" # 考虑使其可配置或移除占位符
@@ -1056,13 +1207,16 @@ class AggregatorApp:
         self._setup_ui()
         self.process_gui_queue()
         
-        # (修改) 检查 Sing-box 可执行文件并更新单选按钮标签
+        # 检查 Sing-box 可执行文件并更新单选按钮标签和状态
         if not self.aggregator.singbox_exists:
-            self.sb_test_radio.config(state='disabled') # (修改) 禁用 sing-box 单选按钮
-            self.tcp_test_radio.invoke() 
-            self._append_log(f"错误: 未在脚本目录找到 {self.aggregator.SINGBOX_EXECUTABLE}。Sing-box 真人测速已禁用。")
+            self.sb_test_radio.config(state='disabled') 
+            self._append_log(f"错误: 未在脚本目录找到 {self.aggregator.SINGBOX_EXECUTABLE}。Sing-box 连接测速已禁用。")
+            # 如果 singbox 不可用，强制切换回 TCP 并禁用 Singbox 选项
+            self.test_mode.set("tcp") 
         else:
-             self.sb_test_radio.config(text="Sing-box 真人测速 (测代理延迟)") # 如果存在则更新标签
+             self.sb_test_radio.config(text="Sing-box 连接测速 (测代理延迟)") 
+             # (v6.1.16) 确保 Singbox 可用时，默认选中它
+             self.test_mode.set("singbox")
 
 
     def _setup_ui(self):
@@ -1113,33 +1267,36 @@ class AggregatorApp:
         speed_test_frame.columnconfigure(1, weight=1)
 
         self.speed_test_enabled = tk.BooleanVar(value=True) 
-        # (修改) 更新 Sing-box 支持的标签文本
         self.speed_test_checkbox = ttk.Checkbutton(speed_test_frame, text="启用测速 (支持 Vmess/Vless/Trojan/SS/Hy/Hy2)", variable=self.speed_test_enabled)
         self.speed_test_checkbox.grid(row=0, column=0, columnspan=3, sticky='w', pady=(0, 5))
 
-        # (修改) 测试模式变量和 Sing-box 的单选按钮
-        self.test_mode = tk.StringVar(value="tcp") # 'tcp' or 'singbox'
+        # (v6.1.16) 设置默认模式为 singbox
+        self.test_mode = tk.StringVar(value="singbox") 
         mode_frame = ttk.Frame(speed_test_frame)
         mode_frame.grid(row=1, column=0, columnspan=3, sticky='w')
+        
+        # (v6.1.16) 交换单选按钮位置
+        self.sb_test_radio = ttk.Radiobutton(mode_frame, text="Sing-box 检测中...", variable=self.test_mode, value="singbox") 
+        self.sb_test_radio.pack(side='left', padx=(0, 15)) # Singbox 在前
         self.tcp_test_radio = ttk.Radiobutton(mode_frame, text="TCP Ping (测端口延迟)", variable=self.test_mode, value="tcp")
-        self.tcp_test_radio.pack(side='left', padx=(0, 15))
-        self.sb_test_radio = ttk.Radiobutton(mode_frame, text="Sing-box 检测中...", variable=self.test_mode, value="singbox") # 占位符文本
-        self.sb_test_radio.pack(side='left')
+        self.tcp_test_radio.pack(side='left') # TCP Ping 在后
         
         ttk.Label(speed_test_frame, text="测速超时 (秒):").grid(row=2, column=0, padx=(0, 10), pady=(5,0), sticky='w')
-        self.timeout_spinbox = ttk.Spinbox(speed_test_frame, from_=1, to=15, width=5) # (修改) 允许更长超时
-        self.timeout_spinbox.set(5) # (修改) 真实测试默认 5 秒
+        self.timeout_spinbox = ttk.Spinbox(speed_test_frame, from_=1, to=30, width=5) # 允许更长超时
+        # (v6.1.16) 默认超时改为 10 秒
+        self.timeout_spinbox.set(10) 
         self.timeout_spinbox.grid(row=2, column=1, sticky='w', pady=(5,0))
 
         ttk.Label(speed_test_frame, text="并发数 (搜索/测速):").grid(row=3, column=0, padx=(0, 10), pady=(5,0), sticky='w')
-        self.concurrency_spinbox = ttk.Spinbox(speed_test_frame, from_=10, to=100, increment=10, width=5) # (修改) Sing-box 可能需要较低的最大并发数?
-        self.concurrency_spinbox.set(20) # (修改) Sing-box 默认 20
+        self.concurrency_spinbox = ttk.Spinbox(speed_test_frame, from_=1, to=100, increment=1, width=5) 
+        # (v6.1.16) 默认并发改为 10
+        self.concurrency_spinbox.set(10) 
         self.concurrency_spinbox.grid(row=3, column=1, sticky='w', pady=(5,0))
         
-        # (修改) Sing-box 的测试 URL 标签
         ttk.Label(speed_test_frame, text="测速地址 (Sing-box):").grid(row=4, column=0, padx=(0, 10), pady=(5,0), sticky='w')
         self.test_url_entry = ttk.Entry(speed_test_frame)
-        self.test_url_entry.insert(0, "http://www.msftconnecttest.com/connecttest.txt")
+        # (v6.1.16) 默认测速地址改为 https cloudflare
+        self.test_url_entry.insert(0, "https://cp.cloudflare.com/") 
         self.test_url_entry.grid(row=4, column=1, columnspan=2, sticky='ew', pady=(5,0))
         
         control_frame = ttk.Frame(main_frame); control_frame.grid(row=5, column=0, pady=10)
@@ -1199,26 +1356,30 @@ class AggregatorApp:
             return
             
         try:
+            # Attempt to decode the full result first to count lines
             decoded_bytes = base64.b64decode(self.full_result_text)
-            full_text = decoded_bytes.decode('utf-8', errors='ignore') # 预览时忽略错误
-            
+            full_text = decoded_bytes.decode('utf-8', errors='ignore') 
             lines = full_text.splitlines()
-            preview_lines = lines[:10]
+            total_lines = len(lines)
             
+            # Take only the first 10 lines for preview content
+            preview_lines = lines[:10]
             preview_text_content = "\n".join(preview_lines)
-            # 仅重新编码预览部分以供显示
+            
+            # Re-encode only the preview part for display
             preview_b64 = base64.b64encode(preview_text_content.encode('utf-8')).decode('utf-8')
             
             display_text = (
                 f"{preview_b64}\n\n"
                 f"--- (以上为前 {len(preview_lines)} 条节点预览) ---\n"
-                f"--- (共 {len(lines)} 条完整结果已保存，请点击“保存为文件...”) ---"
+                f"--- (共 {total_lines} 条完整结果已生成，请点击“保存为文件...”) ---" # Use actual total lines
             )
             
             self.result_text.insert('1.0', display_text)
             
         except Exception as e:
-            self.result_text.insert('1.0', f"生成预览失败: {e}")
+            self.result_text.insert('1.0', f"生成预览失败: {e}\n原始Base64(前100字符): {self.full_result_text[:100]}...")
+
 
     def _append_log(self, message):
         # 确保日志追加是线程安全的（通过队列间接实现）
@@ -1431,9 +1592,6 @@ class AggregatorApp:
                 self.executor.shutdown(wait=True)
                 self.executor = None
 
-            # (*** 修改点 1 ***)
-            # 移除此处的 'if self.stop_task_event.is_set(): return'
-            # 即使下载被中止，也要继续处理已收集的 unique_nodes
             if self.stop_task_event.is_set():
                  self.gui_queue.put(('log', "下载任务已中止。继续处理已下载的节点..."))
 
@@ -1448,23 +1606,17 @@ class AggregatorApp:
                 future_to_node = {} 
 
                 # 为测试专门重新创建执行器
-                # 关闭可能存在的旧执行器
                 if self.executor: self.executor.shutdown(wait=False)
                 self.executor = ThreadPoolExecutor(max_workers=test_concurrency)
 
 
-                # (修改) Sing-box 模式逻辑
+                # Sing-box 模式逻辑
                 if test_mode == 'singbox':
-                    # 可选：如果需要，添加诊断锚点 (稍后可以注释掉)
-                    # self.gui_queue.put(('log', "[诊断]: 正在添加 '测试锚点' 节点..."))
-                    # ANCHOR_NODE = "vless://a341050e-80f0-4501-9aa2-3b854a6c11c5@cf.090227.xyz:443?encryption=none&security=tls&sni=ed.090227.xyz&type=ws&host=ed.090227.xyz&path=%2f#TestAnchor"
-                    # final_node_list.insert(0, ANCHOR_NODE) 
                     
-                    self.gui_queue.put(('log', f"=== 开始 Sing-box 真人测速（并发: {test_concurrency}, 超时: {test_timeout}s） ==="))
+                    self.gui_queue.put(('log', f"=== 开始 Sing-box 连接测速（并发: {test_concurrency}, 超时: {test_timeout}s） ==="))
                     self.gui_queue.put(('log', f"测速目标: {test_url}")) 
                     
                     self.local_ports_queue = queue.Queue()
-                    # (修改) 使用类常量
                     base_port = self.aggregator.SINGBOX_BASE_PORT
                     for i in range(test_concurrency):
                         self.local_ports_queue.put(base_port + i)
@@ -1472,23 +1624,23 @@ class AggregatorApp:
                     self.gui_queue.put(('log', f"步骤 1: 正在提交 {len(final_node_list)} 个节点到线程池..."))
                     
                     
-                    # 提交所有任务，让工作线程获取端口
                     for node_link in final_node_list:
                         if self.stop_task_event.is_set(): break
-                        future = self.executor.submit(self._singbox_test_runner, node_link, test_timeout, test_url) # (修改) 调用 singbox runner
+                        future = self.executor.submit(self._singbox_test_runner, node_link, test_timeout, test_url) 
                         future_to_node[future] = node_link
                     
                     self.gui_queue.put(('log', "步骤 2: 提交完成。开始等待结果并监测死锁..."))
 
 
-                else: # test_mode == 'tcp'
+                # TCP Ping 模式逻辑
+                else: 
                     self.gui_queue.put(('log', f"=== 开始 TCP Ping 测速（并发: {test_concurrency}, 超时: {test_timeout}s） ==="))
                     nodes_to_test = []
                     parsing_errors = 0
                     
                     self.gui_queue.put(('log', "步骤 1: 正在解析节点链接..."))
                     for node_link in final_node_list:
-                        if self.stop_task_event.is_set(): break # 在解析期间检查停止事件
+                        if self.stop_task_event.is_set(): break 
                         parsed = self.aggregator._parse_node_link_for_tcp(node_link)
                         if parsed and parsed[0] and parsed[1]:
                             nodes_to_test.append({'link': node_link, 'addr': parsed[0], 'port': parsed[1]})
@@ -1498,117 +1650,93 @@ class AggregatorApp:
                     self.gui_queue.put(('log', f"解析完成: {len(nodes_to_test)} 个可测速, {parsing_errors} 个解析失败/不支持。"))
                     if not nodes_to_test:
                         self.gui_queue.put(('log', "没有可 TCP Ping 的节点。"));
-                        # (*** 修改点 ***) 如果没有可测速的，也应该继续处理 final_node_list
                     else:
                         self.gui_queue.put(('log', f"步骤 2: 开始并发 TCP Ping {len(nodes_to_test)} 个节点..."))
-                        
-                        
                         future_to_node = {
                             self.executor.submit(self.aggregator._tcp_ping, node['addr'], node['port'], test_timeout): node['link']
                             for node in nodes_to_test
                         }
 
-                # --- (通用) 结果收集 (使用 wait() 代替 as_completed) ---
+                # --- (通用) 结果收集 ---
                 results = [] 
                 tested_count = 0
                 total_to_test = len(future_to_node)
                 
-                # 为真实测试增加稍长的超时缓冲，以应对 Sing-box 启动/关闭？
-                task_timeout = test_timeout + 15 # (修改) 增加缓冲时间
+                # (v6.1.14) 增加缓冲时间到 20 秒
+                task_timeout = test_timeout + 20 
                 deadlock_strikes = 0
                 max_strikes = 3 
 
-                active_futures_set = set(future_to_node.keys()) # 使用集合以便更快地移除
+                active_futures_set = set(future_to_node.keys()) 
 
-                # (*** 修改点 ***) 仅在有任务时才进入循环
                 while active_futures_set:
                     if self.stop_task_event.is_set():
-                         break # 如果已停止则退出循环
+                         break 
 
-                    # 使用带超时的 concurrent.futures.wait
                     done, not_done = wait(
                         active_futures_set,
                         timeout=task_timeout,
                         return_when=FIRST_COMPLETED
                     )
 
-                    if not done: # 发生超时，没有 future 完成
+                    if not done: 
                         deadlock_strikes += 1
                         self.gui_queue.put(('log', f"!! 警告: {task_timeout} 秒内没有任何节点完成测速... (第 {deadlock_strikes}/{max_strikes} 次尝试)"))
                         if deadlock_strikes >= max_strikes:
                             self.gui_queue.put(('log', f"!! 严重错误: 连续 {max_strikes} 次检测到死锁。"))
                             self.gui_queue.put(('log', "!! 可能原因: 杀毒软件/防火墙拦截, 或所有节点均超时/配置错误。"))
                             self.gui_queue.put(('log', "!! 正在强行中止所有测速任务..."))
-                            self.stop_task() # 触发停止
-                            break # 退出循环
-                        continue # 继续等待
+                            self.stop_task() 
+                            break 
+                        continue 
 
-                    deadlock_strikes = 0 # 如果有任务完成则重置计数
+                    deadlock_strikes = 0 
 
                     for future in done:
                         link = future_to_node[future]
                         try:
-                            delay = future.result() # 从完成的 future 获取结果
+                            delay = future.result() 
                             if delay != float('inf'):
                                 results.append((delay, link))
                         except Exception as e:
-                            # 捕获 future.result() 本身可能抛出的异常
                             self.gui_queue.put(('log', f"测速 {link[:30]}... 结果处理出错: {e}"))
 
                         tested_count += 1
-                        active_futures_set.remove(future) # 从活动集合中移除
+                        active_futures_set.remove(future) 
 
-                        # 记录进度
-                        if tested_count % 10 == 0 or tested_count == total_to_test: # (修改) 或许更频繁地记录日志？
+                        # (v6.1.14) 更频繁地记录进度 (每 5 个或完成时)
+                        if tested_count % 5 == 0 or tested_count == total_to_test: 
                             self.gui_queue.put(('log', f"测速进度: {tested_count}/{total_to_test} | 存活: {len(results)}"))
                 
                 # --- 结果收集循环结束 ---
 
-                # (*** 修改点 2 ***)
-                # 如果循环因 stop_task() 退出，取消剩余的 future，但不再 'return'
                 if self.stop_task_event.is_set():
                     self.gui_queue.put(('log', "测速任务被中止。"))
-                    for future in active_futures_set: # 取消任何剩余的活动 future
+                    for future in active_futures_set: 
                         future.cancel()
-                    # (移除 'return') -> 继续处理已收集的 'results'
 
                 self.gui_queue.put(('log', "\n测速完成。正在按延迟排序..."))
                 
                 if not results: 
                     self.gui_queue.put(('log', "未找到任何测速成功的节点。将使用原始列表（如果存在）。"));
-                    # (*** 修改点 ***) 不要在这里 return，让函数继续处理 final_node_list
                 else:
                     results.sort(key=lambda x: x[0])
-                    final_node_list = [link for delay, link in results] # (*** 修改点 ***) 仅当有结果时才覆盖
+                    final_node_list = [link for delay, link in results] 
                 
-                    # 可选：如果添加了锚点并且它存活，则移除
-                    anchor_was_alive = False
-                    anchor_removed = False
-                    # if test_mode == 'singbox' and final_node_list and "#TestAnchor" in final_node_list[0]:
-                    #     anchor_was_alive = True
-                    #     self.gui_queue.put(('log', f"[诊断]: '测试锚点' 存活，延迟: {results[0][0]:.2f} ms"))
-                    #     if len(final_node_list) > 1:
-                    #          final_node_list.pop(0)
-                    #          results.pop(0)
-                    #          anchor_removed = True
-                    # elif test_mode == 'singbox':
-                    #     self.gui_queue.put(('log', "[诊断]: '测试锚点' 测速失败。"))
-
+                    anchor_removed = False # Anchor logic was commented out
 
                     if final_node_list:
-                         # 检查在移除锚点后列表是否变为空
                         if not results and anchor_removed:
                              self.gui_queue.put(('log', "筛选完毕！但移除锚点后无剩余节点。")); 
-                             final_node_list = [] # (*** 修改点 ***) 明确设置为空列表
-                        elif not results: # 如果 final_node_list 非空，则不应发生，但做安全检查
+                             final_node_list = [] 
+                        elif not results: 
                              self.gui_queue.put(('log', "未找到任何测速成功的节点。"));
-                             final_node_list = [] # (*** 修改点 ***) 明确设置为空列表
+                             final_node_list = [] 
                         else:
                              self.gui_queue.put(('log', f"筛选完毕！共 {len(final_node_list)} 个存活节点。最快延迟: {results[0][0]:.2f} ms"))
                     else:
-                        # Occurs if only anchor was alive and removed
                         self.gui_queue.put(('log', "未找到任何测速成功的节点。"));
-                        final_node_list = [] # (*** 修改点 ***) 明确设置为空列表
+                        final_node_list = [] 
 
 
             # --- 测速逻辑结束 ---
@@ -1619,7 +1747,6 @@ class AggregatorApp:
                 self.gui_queue.put(('log', "测速未启用。按默认顺序生成结果..."))
             
             # 最终结果处理
-            # (*** 修改点 ***) 即使中止了，也会执行到这里
             if not final_node_list:
                  self.gui_queue.put(('log', "最终列表为空，无法生成结果。")); return
 
