@@ -1,5 +1,8 @@
-#include "gui.h"
+// 调整包含顺序：common.h 必须在 gui.h 之前，因为它包含 winsock2.h
+// 而 winsock2.h 必须在 windows.h (gui.h 中包含) 之前包含。
 #include "common.h"
+#include "gui.h"
+
 #include <commctrl.h>
 #include <stdio.h>
 
