@@ -46,5 +46,3 @@ target_link_libraries(ProxyAggregator
     crypt32     # Windows Crypto API
     comctl32    # Common Controls (用于 GUI)
 )
-
-# 如果使用 MSVC，可能需要手动复制 DLL 或进行其他设置，但在 GitHub Actions 中通常环境已就绪
