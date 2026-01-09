@@ -9,11 +9,9 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 add_definitions(-DUNICODE -D_UNICODE)
 
 # --- 2. 查找依赖库 ---
-# 查找 OpenSSL (用于 utils_net.c)
 find_package(OpenSSL REQUIRED)
 
 # --- 3. 设置文件 ---
-# 头文件路径
 include_directories(include)
 include_directories(${OPENSSL_INCLUDE_DIR})
 
@@ -31,18 +29,23 @@ set(SOURCES
     src/cJSON.c
 )
 
-# 资源文件 (图标等)
 set(RESOURCES resources/resource.rc)
 
 # --- 4. 创建目标 ---
-# WIN32 选项告诉编译器这是一个 GUI 程序，而不是控制台程序 (即入口是 WinMain)
+# WIN32 标记它是 GUI 程序
 add_executable(ProxyAggregator WIN32 ${SOURCES} ${RESOURCES})
 
-# --- 5. 链接库 ---
+# --- 5. 链接配置 ---
+# 关键修复：MinGW 使用 wWinMain 需要 -municode
+if(MINGW)
+    target_link_options(ProxyAggregator PRIVATE -municode)
+endif()
+
+# 链接库
 target_link_libraries(ProxyAggregator
     OpenSSL::SSL
     OpenSSL::Crypto
     ws2_32      # Winsock 2
     crypt32     # Windows Crypto API
-    comctl32    # Common Controls (用于 GUI)
+    comctl32    # Common Controls (GUI)
 )
