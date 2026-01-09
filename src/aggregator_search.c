@@ -7,6 +7,27 @@
 #include <string.h>
 #include <ctype.h>
 
+// --- 补充函数：strnstr 实现 (Windows/MinGW 缺省不支持) ---
+static char *strnstr(const char *haystack, const char *needle, size_t len) {
+    size_t i;
+    size_t needle_len;
+
+    if (0 == (needle_len = strlen(needle)))
+        return (char *)haystack;
+
+    for (i = 0; i < len; i++) {
+        if (i + needle_len > len) {
+            return NULL;
+        }
+        if ((haystack[0] == needle[0]) &&
+            (strncmp(haystack, needle, needle_len) == 0)) {
+            return (char *)haystack;
+        }
+        haystack++;
+    }
+    return NULL;
+}
+
 // --- 辅助函数：判断字符是否为 URL 有效字符 ---
 static int IsUrlChar(char c) {
     return isalnum((unsigned char)c) || c == '-' || c == '_' || c == '.' || 
@@ -67,14 +88,6 @@ static void ExtractLinksFromContent(const char* content, HWND hNotifyWnd) {
                     if (link) {
                         strncpy(link, start, len);
                         link[len] = '\0';
-                        
-                        // 发送给主线程处理 (去重和显示)
-                        // 使用 SendMessage 同步发送，确保 link 在处理完前有效? 
-                        // 不，主线程可能会卡顿。这里使用 PostMessage + 动态内存，约定主线程释放 lParam
-                        // 或者更安全：在这里处理去重 (需要加锁访问全局 Set)，然后只通知。
-                        
-                        // 简化方案：直接发给 UI，UI 负责去重
-                        // 注意：为了避免 UI 线程频繁 malloc/free，可以先在工作线程去重
                         
                         EnterCriticalSection(&g_dataLock);
                         // 简单的线性查重 (性能一般，但数量级不大时可接受)
@@ -146,7 +159,6 @@ void SearchGitHubKeywords(const char* token, const char* query_str, int pages, H
             if (WaitForSingleObject(g_hStopEvent, 0) == WAIT_OBJECT_0) break;
 
             // 构造 API URL
-            // https://api.github.com/search/code?q="keyword"+in:file&sort=indexed&order=desc&per_page=100&page=N
             char api_url[1024];
             snprintf(api_url, sizeof(api_url), 
                 "https://api.github.com/search/code?q=\"%s\"+in:file&sort=indexed&order=desc&per_page=30&page=%d", // 减小每页数量以防超时
@@ -155,15 +167,6 @@ void SearchGitHubKeywords(const char* token, const char* query_str, int pages, H
             // Log
             snprintf(logMsg, sizeof(logMsg), "  请求第 %d 页...", page);
             PostMessage(hNotifyWnd, WM_APP_LOG, 0, (LPARAM)_strdup(logMsg));
-
-            // 执行请求 (GitHub API 需要 User-Agent 和 Authorization)
-            // Utils_HttpGet 默认带 UA。需要处理 Token。
-            // 简单起见，我们修改 HttpGet 的实现或在这里手动拼接 headers
-            // 由于 HttpGet 封装较简单，这里假设 Utils_HttpGet 内部会处理好 SSL
-            // 如果需要加 Token，可能需要扩展 HttpGet 接口。
-            // 暂时使用未授权请求 (速率限制较低)，或者把 token 放入 url? 不行，token 必须在 header。
-            // 鉴于篇幅，这里暂不实现 Authorization Header 的动态注入，仅依赖 IP 限制。
-            // (注：若 aggregator_app.py 必须 Token，建议后续扩展 HttpGet 支持 extra headers)
 
             char* json_resp = HttpGet(api_url, g_config.enable_proxy ? g_config.proxy_url : NULL, 10);
             
@@ -193,8 +196,6 @@ void SearchGitHubKeywords(const char* token, const char* query_str, int pages, H
                     cJSON* html_url = cJSON_GetObjectItem(item, "html_url");
                     
                     if (html_url && html_url->valuestring) {
-                        // 转换 URL: github.com/user/repo/blob/branch/file -> raw.githubusercontent.com/user/repo/branch/file
-                        // 简单替换 "github.com" -> "raw.githubusercontent.com", "/blob/" -> "/"
                         char raw_url[2048];
                         char* src = html_url->valuestring;
                         char* p_blob = strstr(src, "/blob/");
@@ -212,8 +213,6 @@ void SearchGitHubKeywords(const char* token, const char* query_str, int pages, H
                                 // 现在 raw_url 里还有 /blob/，需要去掉
                                 char* p_blob_in_raw = strstr(raw_url, "/blob/");
                                 if (p_blob_in_raw) {
-                                    // 移动后续字符串覆盖 /blob
-                                    // /blob/ is 6 chars. replace with / (1 char). move left by 5.
                                     memmove(p_blob_in_raw + 1, p_blob_in_raw + 6, strlen(p_blob_in_raw + 6) + 1);
                                 }
 
