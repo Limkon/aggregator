@@ -1,94 +1,50 @@
-#ifndef COMMON_H
-#define COMMON_H
+cmake_minimum_required(VERSION 3.15)
+project(ProxyAggregator LANGUAGES C)
 
-#include <windows.h>
-#include <stdbool.h>
+# --- 1. 配置构建选项 ---
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
 
-// --- 1. 常量定义 ---
-#define APP_NAME            L"ProxyAggregator"
-#define APP_VERSION         L"v1.0.0"
+# 支持 Windows Unicode 字符集
+add_definitions(-DUNICODE -D_UNICODE)
 
-#define MAX_URL_LEN         2048
-#define MAX_REMARK_LEN      256
-#define MAX_HOST_LEN        256
-#define MAX_NODES           10000  // 最大支持节点数 (防止内存溢出)
+# --- 2. 查找依赖库 ---
+# 查找 OpenSSL (用于 utils_net.c)
+find_package(OpenSSL REQUIRED)
 
-// Sing-box 默认配置
-#define SINGBOX_BASE_PORT   10900
-#define SINGBOX_EXE_NAME    "sing-box.exe"
+# --- 3. 设置文件 ---
+# 头文件路径
+include_directories(include)
+include_directories(${OPENSSL_INCLUDE_DIR})
 
-// --- 2. 自定义 Windows 消息 ---
-// 用于工作线程向主 UI 线程发送通知
-#define WM_APP_LOG          (WM_USER + 100)  // 参数: lParam = (char*) message
-#define WM_APP_PROGRESS     (WM_USER + 101)  // 参数: wParam = current, lParam = total
-#define WM_APP_TASK_DONE    (WM_USER + 102)  // 参数: wParam = task_type (0=Search, 1=Process)
-#define WM_APP_PREVIEW      (WM_USER + 103)  // 参数: 无 (通知 UI 刷新预览文本)
+# 源文件列表
+set(SOURCES
+    src/main.c
+    src/gui_main.c
+    src/aggregator_core.c
+    src/aggregator_search.c
+    src/parser_nodes.c
+    src/speedtest_singbox.c
+    src/speedtest_tcp.c
+    src/utils_base64.c
+    src/utils_net.c
+    src/cJSON.c
+)
 
-// --- 3. 数据结构 ---
+# 资源文件 (图标等)
+set(RESOURCES resources/resource.rc)
 
-// 节点协议类型
-typedef enum {
-    NODE_UNKNOWN = 0,
-    NODE_VMESS,
-    NODE_VLESS,
-    NODE_TROJAN,
-    NODE_SS,
-    NODE_SSR,
-    NODE_HYSTERIA2
-} NodeType;
+# --- 4. 创建目标 ---
+# WIN32 选项告诉编译器这是一个 GUI 程序，而不是控制台程序 (即入口是 WinMain)
+add_executable(ProxyAggregator WIN32 ${SOURCES} ${RESOURCES})
 
-// 节点信息结构体 (替代 Python 字典)
-// 注意：为了简化内存管理，这里使用定长字符数组，虽然浪费少量内存但能避免碎片
-typedef struct {
-    int id;                     // 唯一 ID
-    NodeType type;              // 协议类型
-    char original_link[MAX_URL_LEN]; // 原始订阅链接
-    
-    // 解析后的核心信息 (用于测速)
-    char address[MAX_HOST_LEN];
-    int port;
-    char remark[MAX_REMARK_LEN];
-    
-    // 测速结果
-    double latency;             // 延迟 (毫秒)，-1 表示超时/失败
-    bool is_alive;              // 是否存活
-} ProxyNode;
+# --- 5. 链接库 ---
+target_link_libraries(ProxyAggregator
+    OpenSSL::SSL
+    OpenSSL::Crypto
+    ws2_32      # Winsock 2
+    crypt32     # Windows Crypto API
+    comctl32    # Common Controls (用于 GUI)
+)
 
-// 测速模式
-typedef enum {
-    TEST_MODE_TCP = 0,
-    TEST_MODE_SINGBOX
-} TestMode;
-
-// 全局配置结构体 (对应 UI 上的输入项)
-typedef struct {
-    // 搜索配置
-    char github_token[128];
-    char search_keywords[512]; // 逗号分隔
-    int search_pages;
-    
-    // 网络代理配置 (用于搜索和下载)
-    bool enable_proxy;
-    char proxy_url[128];
-    
-    // 测速配置
-    bool enable_speedtest;
-    TestMode test_mode;
-    int timeout;          // 秒
-    int concurrency;      // 并发数
-    char test_url[256];   // Sing-box 测速目标 URL
-} AppConfig;
-
-// --- 4. 全局变量声明 ---
-// 定义在 main.c 或 globals.c 中，此处 extern 引用
-
-extern AppConfig g_config;            // 全局配置
-extern ProxyNode g_nodes[MAX_NODES];  // 节点数组
-extern int g_node_count;              // 当前节点数量
-extern CRITICAL_SECTION g_dataLock;   // 数据读写锁 (保护 g_nodes)
-extern HWND g_hMainWnd;               // 主窗口句柄
-
-// 任务控制
-extern HANDLE g_hStopEvent;           // 用于通知工作线程停止的事件
-
-#endif // COMMON_H
+# 如果使用 MSVC，可能需要手动复制 DLL 或进行其他设置，但在 GitHub Actions 中通常环境已就绪
