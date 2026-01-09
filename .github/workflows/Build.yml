@@ -1,0 +1,109 @@
+name: Build ProxyAggregator (Manual)
+
+on:
+  workflow_dispatch: # 仅手动触发
+
+jobs:
+  # --- 任务 1：OpenSSL 编译 (仅当无缓存时运行) ---
+  build-openssl:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          cache: true
+          install: git
+          path-type: minimal
+
+      - name: Install Build Tools
+        shell: msys2 {0}
+        run: |
+          sed -i 's/^SigLevel.*/SigLevel = Never/' /etc/pacman.conf
+          pacman -Sy --noconfirm mingw-w64-x86_64-gcc mingw-w64-x86_64-make
+
+      - name: Cache OpenSSL
+        id: cache-openssl
+        uses: actions/cache@v4
+        with:
+          path: openssl_dist
+          # 缓存 Key：改变 v1 为 v2 可强制重新编译 OpenSSL
+          key: openssl-libs-v1
+
+      - name: Building OpenSSL
+        shell: msys2 {0}
+        # 关键逻辑：只有缓存未命中时才执行编译
+        if: steps.cache-openssl.outputs.cache-hit != 'true'
+        run: |
+          echo "Cache miss. Building OpenSSL from source..."
+          git clone --depth 1 https://github.com/openssl/openssl.git -b openssl-3.1.4 openssl-src
+          cd openssl-src
+          
+          # 静态编译配置
+          ./Configure mingw64 no-shared --prefix=${GITHUB_WORKSPACE}/openssl_dist
+          
+          # 修正 MinGW 类型定义 (参考 MandalaECH)
+          sed -i 's/typedef __int64 ossl_ssize_t;/typedef long long ossl_ssize_t;/g' include/openssl/e_os2.h
+          
+          mingw32-make -j4
+          mingw32-make install_sw
+          echo "OpenSSL build complete."
+
+  # --- 任务 2：构建应用程序 (始终运行，使用缓存的 OpenSSL) ---
+  build-app:
+    needs: build-openssl # 必须等待任务 1 完成
+    runs-on: windows-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          cache: true
+          install: git
+          path-type: minimal
+
+      - name: Install Build Tools
+        shell: msys2 {0}
+        run: |
+          sed -i 's/^SigLevel.*/SigLevel = Never/' /etc/pacman.conf
+          # 安装 CMake 用于构建项目
+          pacman -Sy --noconfirm mingw-w64-x86_64-gcc mingw-w64-x86_64-make mingw-w64-x86_64-cmake
+
+      - name: Restore OpenSSL Cache
+        id: cache-openssl
+        uses: actions/cache@v4
+        with:
+          path: openssl_dist
+          key: openssl-libs-v1
+          fail-on-cache-miss: true # 理论上不应发生，因为任务 1 保证了缓存存在
+
+      - name: Build ProxyAggregator
+        shell: msys2 {0}
+        run: |
+          mkdir build
+          cd build
+          
+          # 指定 OpenSSL 路径
+          cmake -G "MinGW Makefiles" \
+            -DOPENSSL_ROOT_DIR="${GITHUB_WORKSPACE}/openssl_dist" \
+            -DCMAKE_BUILD_TYPE=Release \
+            ..
+          
+          mingw32-make -j4
+          
+          echo "Build finished. Output:"
+          ls -lh ProxyAggregator.exe
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ProxyAggregator-Windows-x64
+          path: build/ProxyAggregator.exe
