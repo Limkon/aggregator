@@ -1,0 +1,64 @@
+#include <windows.h>
+
+// 1. 应用程序图标
+// ID 101 对应 src/gui_main.c 中的 MAKEINTRESOURCE(101)
+// 请确保 resources 目录下有名为 app.ico 的图标文件
+101 ICON "app.ico"
+
+// 2. 版本信息结构
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION 1,0,0,0
+PRODUCTVERSION 1,0,0,0
+FILEFLAGSMASK 0x3fL
+#ifdef _DEBUG
+FILEFLAGS 0x1L
+#else
+FILEFLAGS 0x0L
+#endif
+FILEOS 0x40004L
+FILETYPE 0x1L
+FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        // 0804 = 中文简体, 04b0 = Unicode
+        BLOCK "080404b0"
+        BEGIN
+            VALUE "CompanyName", "ProxyAggregator Developer"
+            VALUE "FileDescription", "Proxy Aggregator (C Language Refactor)"
+            VALUE "FileVersion", "1.0.0.0"
+            VALUE "InternalName", "ProxyAggregator"
+            VALUE "LegalCopyright", "Copyright (C) 2024"
+            VALUE "OriginalFilename", "ProxyAggregator.exe"
+            VALUE "ProductName", "Proxy Aggregator"
+            VALUE "ProductVersion", "1.0.0.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x804, 1200
+    END
+END
+
+// 3. Manifest (用于启用 Windows 现代控件风格，如圆角按钮、进度条等)
+// ID 1, Type 24 (RT_MANIFEST)
+1 24
+BEGIN
+    "<?xml version=""1.0"" encoding=""UTF-8"" standalone=""yes""?>\r\n"
+    "<assembly xmlns=""urn:schemas-microsoft-com:asm.v1"" manifestVersion=""1.0"">\r\n"
+    "  <assemblyIdentity version=""1.0.0.0"" processorArchitecture=""*"" name=""ProxyAggregator"" type=""win32""/>\r\n"
+    "  <description>Proxy Aggregator Application</description>\r\n"
+    "  <dependency>\r\n"
+    "    <dependentAssembly>\r\n"
+    "      <assemblyIdentity type=""win32"" name=""Microsoft.Windows.Common-Controls"" version=""6.0.0.0"" processorArchitecture=""*"" publicKeyToken=""6595b64144ccf1df"" language=""*""/>\r\n"
+    "    </dependentAssembly>\r\n"
+    "  </dependency>\r\n"
+    "  <trustInfo xmlns=""urn:schemas-microsoft-com:asm.v3"">\r\n"
+    "    <security>\r\n"
+    "      <requestedPrivileges>\r\n"
+    "        <requestedExecutionLevel level=""asInvoker"" uiAccess=""false""/>\r\n"
+    "      </requestedPrivileges>\r\n"
+    "    </security>\r\n"
+    "  </trustInfo>\r\n"
+    "</assembly>"
+END
