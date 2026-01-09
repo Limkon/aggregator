@@ -64,14 +64,43 @@ extern void StartProcessTask();
 extern void StopCurrentTask();
 extern void SaveResultToFile(HWND hOwner, const char* content);
 
-// --- 辅助函数：创建字体 ---
+// --- 辅助函数：创建字体 (强制与系统一致) ---
 void CreateAppFont() {
     NONCLIENTMETRICSW ncm = { sizeof(NONCLIENTMETRICSW) };
+    
+    // 1. 优先尝试获取系统当前的消息字体 (System Message Font)
+    // 这通常能获取到 Segoe UI (英文) 或 Microsoft YaHei UI (中文)，保证与系统完全一致
     if (SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(NONCLIENTMETRICSW), &ncm, 0)) {
         hFontApp = CreateFontIndirectW(&ncm.lfMessageFont);
-    } else {
+    } 
+    
+    // 2. 如果系统API调用失败，强制尝试加载 "Microsoft YaHei UI" (微软雅黑)
+    // 避免回退到 DEFAULT_GUI_FONT (丑陋的宋体点阵)
+    if (!hFontApp) {
+        hFontApp = CreateFontW(
+            -12,                        // 高度 (负值表示字符高度)
+            0, 0, 0,                    // 宽度, 倾斜, 方向
+            FW_NORMAL,                  // 粗细
+            FALSE, FALSE, FALSE,        // 斜体, 下划线, 删除线
+            DEFAULT_CHARSET,            // 字符集
+            OUT_DEFAULT_PRECIS,         // 输出精度
+            CLIP_DEFAULT_PRECIS,        // 裁剪精度
+            CLEARTYPE_QUALITY,          // 强制使用 ClearType 抗锯齿
+            DEFAULT_PITCH | FF_SWISS,   // 字体族
+            L"Microsoft YaHei UI"       // 字体名称
+        );
+    }
+
+    // 3. 最后的保底 (标准默认字体)
+    if (!hFontApp) {
         hFontApp = GetStockObject(DEFAULT_GUI_FONT);
     }
+}
+
+// --- 辅助函数：回调设置子控件字体 ---
+BOOL CALLBACK EnumChildProcSetFont(HWND hwnd, LPARAM lParam) {
+    SendMessage(hwnd, WM_SETFONT, (WPARAM)lParam, TRUE);
+    return TRUE;
 }
 
 // --- 辅助函数：追加日志 ---
@@ -147,11 +176,12 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
 
             // 1. 搜索区域 (Group Box)
             HWND hGrpSearch = CreateWindowW(L"BUTTON", L"在线搜索订阅", WS_CHILD | WS_VISIBLE | BS_GROUPBOX, 10, 10, 810, 100, hWnd, (HMENU)ID_GRP_SEARCH, NULL, NULL);
+            // GroupBox 也设置字体，保证标题一致
             SendMessage(hGrpSearch, WM_SETFONT, (WPARAM)hFontApp, TRUE);
 
             CreateWindowW(L"STATIC", L"GitHub Token:", WS_CHILD | WS_VISIBLE, 25, 35, 90, 20, hWnd, (HMENU)ID_LBL_TOKEN, NULL, NULL);
             hEdtToken = CreateWindowW(L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL, 120, 32, 500, 23, hWnd, (HMENU)ID_EDT_TOKEN, NULL, NULL);
-            SendMessage(hEdtToken, EM_SETCUEBANNER, TRUE, (LPARAM)L"（可选，提高限额）"); // Placeholder
+            SendMessage(hEdtToken, EM_SETCUEBANNER, TRUE, (LPARAM)L"（可选，提高限额）"); 
 
             CreateWindowW(L"STATIC", L"搜索关键字:", WS_CHILD | WS_VISIBLE, 25, 65, 90, 20, hWnd, (HMENU)ID_LBL_QUERY, NULL, NULL);
             hEdtQuery = CreateWindowW(L"EDIT", L"clash,v2ray,sub,vmess,trojan,vless,hysteria2", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL, 120, 62, 500, 23, hWnd, (HMENU)ID_EDT_QUERY, NULL, NULL);
@@ -203,8 +233,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             hBtnSave = CreateWindowW(L"BUTTON", L"保存为文件...", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 700, 710, 100, 25, hWnd, (HMENU)ID_BTN_SAVE, NULL, NULL);
             hEdtResult = CreateWindowW(L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL, 20, 740, 790, 120, hWnd, (HMENU)ID_EDT_RESULT, NULL, NULL);
 
-            // 设置所有控件字体
-            EnumChildWindows(hWnd, (WNDENUMPROC)(void(*)(HWND,LPARAM))SendMessage, (LPARAM)hFontApp); // 简单粗暴设字体
+            // 强制设置所有子控件字体与系统一致
+            if (hFontApp) {
+                EnumChildWindows(hWnd, EnumChildProcSetFont, (LPARAM)hFontApp);
+            }
         }
         break;
 
@@ -239,9 +271,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
                 int len = GetWindowTextLength(hEdtResult);
                 if (len > 0) {
                     char* buf = (char*)malloc(len + 1);
-                    GetWindowTextA(hEdtResult, buf, len + 1);
-                    SaveResultToFile(hWnd, buf);
-                    free(buf);
+                    if (buf) {
+                        GetWindowTextA(hEdtResult, buf, len + 1);
+                        SaveResultToFile(hWnd, buf);
+                        free(buf);
+                    }
                 } else {
                     MessageBoxW(hWnd, L"没有内容可保存", L"提示", MB_OK);
                 }
