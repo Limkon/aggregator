@@ -1,3 +1,4 @@
+/* src/aggregator_core.c */
 #include "common.h"
 #include "gui.h"
 #include "utils_net.h"
@@ -11,7 +12,7 @@
 // --- 外部函数声明 (来自其他模块) ---
 extern void SearchGitHubKeywords(const char* token, const char* query, int pages, HWND hNotify);
 extern void ParseNodeBasic(const char* link, ProxyNode* node);
-// 测速函数 (将在 speedtest_*.c 中实现)
+// 测速函数 (在 speedtest_*.c 中实现)
 extern double SpeedTest_TcpPing(const char* addr, int port, int timeout);
 extern double SpeedTest_Singbox(const char* node_link, int port_index, int timeout, const char* test_url);
 
@@ -163,7 +164,7 @@ static void RunConcurrentTasks(void* items, int count, int item_size, TaskCallba
 }
 
 // ----------------------------------------------------------------
-// 子任务 A: 下载并解析订阅
+// 子任务 A: 下载并解析订阅 [Refactored]
 // ----------------------------------------------------------------
 
 typedef struct {
@@ -172,16 +173,21 @@ typedef struct {
 
 void DownloadSubWorker(void* data, int idx) {
     SubLink* link = (SubLink*)data;
-    char logBuf[256];
+    char logBuf[512];
     
-    snprintf(logBuf, sizeof(logBuf), "下载: %s", link->url);
+    // [Log] 增加线程索引标识
+    snprintf(logBuf, sizeof(logBuf), "[T-%d] 下载: %s", idx, link->url);
     PostMessage(g_hMainWnd, WM_APP_LOG, 0, (LPARAM)_strdup(logBuf));
     
     const char* proxy = g_config.enable_proxy ? g_config.proxy_url : NULL;
-    char* content = HttpGet(link->url, proxy, 15);
+    
+    // [Net] 使用更新后的 HttpGet，设置 20s 超时以适应大文件
+    char* content = HttpGet(link->url, proxy, 20);
     
     if (content) {
         int added = 0;
+        int original_len = (int)strlen(content);
+
         // 1. 尝试 Base64 解码
         char* decoded = Base64Decode(content);
         char* target = decoded ? decoded : content; // 如果解码失败，尝试原始内容
@@ -194,14 +200,16 @@ void DownloadSubWorker(void* data, int idx) {
             while (*line && (*line == ' ' || *line == '\t')) line++;
             
             // 识别协议
-            if (strncmp(line, "vmess://", 8) == 0 ||
-                strncmp(line, "vless://", 8) == 0 ||
-                strncmp(line, "ss://", 5) == 0 ||
-                strncmp(line, "trojan://", 9) == 0 ||
-                strncmp(line, "hysteria2://", 12) == 0 ||
-                strncmp(line, "hy2://", 6) == 0) {
-                    
-                if (AddNodeSafe(line)) added++;
+            if (*line) {
+                if (strncmp(line, "vmess://", 8) == 0 ||
+                    strncmp(line, "vless://", 8) == 0 ||
+                    strncmp(line, "ss://", 5) == 0 ||
+                    strncmp(line, "trojan://", 9) == 0 ||
+                    strncmp(line, "hysteria2://", 12) == 0 ||
+                    strncmp(line, "hy2://", 6) == 0) {
+                        
+                    if (AddNodeSafe(line)) added++;
+                }
             }
             line = strtok_s(NULL, "\n\r", &ctx);
         }
@@ -209,10 +217,10 @@ void DownloadSubWorker(void* data, int idx) {
         if (decoded) free(decoded);
         free(content);
         
-        snprintf(logBuf, sizeof(logBuf), "  -> 解析出 %d 个节点", added);
+        snprintf(logBuf, sizeof(logBuf), "  -> [T-%d] 完成，大小: %d B, 解析: %d 个", idx, original_len, added);
         PostMessage(g_hMainWnd, WM_APP_LOG, 0, (LPARAM)_strdup(logBuf));
     } else {
-        snprintf(logBuf, sizeof(logBuf), "  -> 下载失败");
+        snprintf(logBuf, sizeof(logBuf), "  -> [T-%d] 下载失败 (超时或网络错误)", idx);
         PostMessage(g_hMainWnd, WM_APP_LOG, 0, (LPARAM)_strdup(logBuf));
     }
 }
