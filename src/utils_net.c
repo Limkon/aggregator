@@ -20,7 +20,7 @@ static volatile LONG s_ctxInitState = 0;
 static volatile LONG s_active_requests = 0; 
 static volatile BOOL s_is_cleaning_up = FALSE; 
 
-// --- 简单的 URL 解析结构 ---
+// --- URL 解析结构 ---
 typedef struct { 
     char scheme[16];
     char host[256]; 
@@ -46,7 +46,6 @@ static BOOL ParseUrl(const char* url, URL_COMPONENTS_SIMPLE* out) {
     }
     else return FALSE;
     
-    // 查找 Host 结束位置
     const char* slash = strchr(p, '/');
     int hostLen = slash ? (int)(slash - p) : (int)strlen(p);
     
@@ -55,7 +54,6 @@ static BOOL ParseUrl(const char* url, URL_COMPONENTS_SIMPLE* out) {
     strncpy(out->host, p, hostLen); 
     out->host[hostLen] = 0; 
     
-    // 处理端口号
     char* colon = strchr(out->host, ':');
     if (colon) { 
         *colon = 0; 
@@ -63,7 +61,6 @@ static BOOL ParseUrl(const char* url, URL_COMPONENTS_SIMPLE* out) {
         if (out->port <= 0 || out->port > 65535) return FALSE;
     }
     
-    // 处理路径
     if (slash) {
         if (strlen(slash) >= sizeof(out->path)) return FALSE;
         strcpy(out->path, slash);
@@ -73,7 +70,7 @@ static BOOL ParseUrl(const char* url, URL_COMPONENTS_SIMPLE* out) {
     return TRUE;
 }
 
-// 辅助函数：初始化全局 SSL Context
+// 辅助函数：初始化 SSL
 static BOOL InitSSLContext() {
     if (g_ssl_ctx != NULL) return TRUE;
 
@@ -82,10 +79,9 @@ static BOOL InitSSLContext() {
         SSL_CTX* ctx = SSL_CTX_new(method);
         
         if (ctx) {
-            // 加载系统默认证书库或指定文件
+            // 尝试加载证书，若失败则禁用验证以保证运行
             if (SSL_CTX_load_verify_locations(ctx, "cacert.pem", NULL) != 1) {
                 if (SSL_CTX_load_verify_locations(ctx, "resources/cacert.pem", NULL) != 1) {
-                    // 找不到证书时，临时禁用验证以保证功能可用
                     SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
                 } else {
                     SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
@@ -93,7 +89,6 @@ static BOOL InitSSLContext() {
             } else {
                 SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
             }
-            
             EnterCriticalSection(&g_dataLock);
             g_ssl_ctx = ctx;
             LeaveCriticalSection(&g_dataLock);
@@ -113,8 +108,8 @@ static BOOL InitSSLContext() {
     }
 }
 
-// 内部函数：单次请求，返回 Body 或 Location Header
-static char* InternalRequest(const char* url, int timeout_sec, char* out_location, int loc_size) {
+// 内部单次请求函数
+static char* InternalRequest(const char* url, int timeout_sec, const char* auth_token, char* out_location, int loc_size) {
     if (s_is_cleaning_up) return NULL;
     
     SOCKET s = INVALID_SOCKET;
@@ -126,11 +121,9 @@ static char* InternalRequest(const char* url, int timeout_sec, char* out_locatio
     URL_COMPONENTS_SIMPLE u;
     if (!ParseUrl(url, &u)) return NULL;
 
-    // 1. SSL 初始化 (仅 HTTPS 需要)
     BOOL is_https = (strcmp(u.scheme, "https") == 0);
     if (is_https && !InitSSLContext()) return NULL;
 
-    // 2. DNS 解析
     struct addrinfo hints = {0};
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
@@ -139,7 +132,6 @@ static char* InternalRequest(const char* url, int timeout_sec, char* out_locatio
 
     if (getaddrinfo(u.host, portStr, &hints, &res) != 0) return NULL;
 
-    // 3. 建立连接
     struct addrinfo* ptr = NULL;
     for (ptr = res; ptr != NULL; ptr = ptr->ai_next) {
         if (s_is_cleaning_up) break;
@@ -160,30 +152,34 @@ static char* InternalRequest(const char* url, int timeout_sec, char* out_locatio
         return NULL;
     }
 
-    // 4. SSL 握手
     if (is_https) {
         ssl = SSL_new(g_ssl_ctx);
         if (!ssl) goto cleanup;
-
         SSL_set_fd(ssl, (int)s);
         SSL_set_tlsext_host_name(ssl, u.host); 
         if (SSL_connect(ssl) != 1) goto cleanup;
     }
 
-    // 5. 发送请求
+    // 构造 Headers
+    char headers[512];
+    headers[0] = 0;
+    if (auth_token && strlen(auth_token) > 0) {
+        snprintf(headers, sizeof(headers), "Authorization: Bearer %s\r\n", auth_token);
+    }
+
     char req[4096];
     snprintf(req, sizeof(req), 
         "GET %s HTTP/1.1\r\n"
         "Host: %s\r\n"
-        "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36\r\n"
+        "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)\r\n"
+        "%s" // 插入额外 Header
         "Connection: close\r\n"
         "\r\n", 
-        u.path, u.host);
+        u.path, u.host, headers);
 
     int sent = is_https ? SSL_write(ssl, req, (int)strlen(req)) : send(s, req, (int)strlen(req), 0);
     if (sent <= 0) goto cleanup;
 
-    // 6. 读取响应
     size_t total_cap = 65536; 
     size_t total_len = 0;
     buf = (char*)malloc(total_cap);
@@ -191,7 +187,7 @@ static char* InternalRequest(const char* url, int timeout_sec, char* out_locatio
 
     ULONGLONG tick_start = GetTickCount64();
     unsigned long on = 1;
-    ioctlsocket(s, FIONBIO, &on); // 非阻塞
+    ioctlsocket(s, FIONBIO, &on);
 
     while (!s_is_cleaning_up) {
         if (GetTickCount64() - tick_start > (ULONGLONG)(timeout_sec * 1000)) break;
@@ -223,21 +219,16 @@ static char* InternalRequest(const char* url, int timeout_sec, char* out_locatio
         }
     }
 
-    // 7. 解析响应
     if (buf && total_len > 0) {
         buf[total_len] = 0;
-        
-        // 检查状态码
         int status_code = 0;
         if (sscanf(buf, "HTTP/%*d.%*d %d", &status_code) == 1) {
-            
-            // 处理重定向 (301, 302, 307, 308)
-            if (status_code == 301 || status_code == 302 || status_code == 307 || status_code == 308) {
+            if (status_code >= 300 && status_code < 400) {
                 if (out_location) {
                     char* loc = strstr(buf, "\nLocation:");
                     if (!loc) loc = strstr(buf, "\nlocation:");
                     if (loc) {
-                        loc += 10; // skip "\nLocation:"
+                        loc += 10;
                         while (*loc == ' ' || *loc == '\t') loc++;
                         char* end = strchr(loc, '\r');
                         if (!end) end = strchr(loc, '\n');
@@ -250,7 +241,6 @@ static char* InternalRequest(const char* url, int timeout_sec, char* out_locatio
                     }
                 }
             } 
-            // 处理成功 (200)
             else if (status_code == 200) {
                 char* body_start = strstr(buf, "\r\n\r\n");
                 if (body_start) {
@@ -274,8 +264,8 @@ cleanup:
     return result;
 }
 
-// 核心函数：执行 GET 请求 (支持自动重定向)
-char* HttpGet(const char* url, const char* proxy, int timeout_sec) {
+// 通用 HTTP 请求处理（含重定向）
+static char* PerformHttpRequest(const char* url, int timeout_sec, const char* token) {
     if (s_is_cleaning_up) return NULL;
     InterlockedIncrement(&s_active_requests);
 
@@ -284,38 +274,30 @@ char* HttpGet(const char* url, const char* proxy, int timeout_sec) {
     char* final_result = NULL;
     
     int redirects = 0;
-    while (redirects < 5) { // 最多允许 5 次重定向
+    while (redirects < 5) {
         char location[MAX_URL_LEN] = {0};
+        char* result = InternalRequest(current_url, timeout_sec, token, location, sizeof(location));
         
-        // 发起请求
-        char* result = InternalRequest(current_url, timeout_sec, location, sizeof(location));
-        
-        // 如果有结果 (200 OK)，直接返回
         if (result) {
             final_result = result;
             break;
         }
         
-        // 如果没有结果，但有 Location (重定向)
         if (location[0] != 0) {
-            // 处理相对路径
             if (strncmp(location, "http", 4) != 0) {
-                // 简单的相对路径拼接 (仅支持以 / 开头的绝对路径)
                 if (location[0] == '/') {
                     URL_COMPONENTS_SIMPLE u;
                     ParseUrl(current_url, &u);
                     snprintf(current_url, sizeof(current_url), "%s://%s%s", u.scheme, u.host, location);
                 } else {
-                    // 复杂相对路径暂不支持，直接失败
                     break;
                 }
             } else {
                 strncpy(current_url, location, sizeof(current_url) - 1);
             }
             redirects++;
-            continue; // 重试新地址
+            continue;
         } else {
-            // 既无结果也无重定向，失败
             break;
         }
     }
@@ -324,7 +306,17 @@ char* HttpGet(const char* url, const char* proxy, int timeout_sec) {
     return final_result;
 }
 
-// 连通性测试
+// 接口 1: 普通下载 (代理暂未实现)
+char* HttpGet(const char* url, const char* proxy, int timeout_sec) {
+    return PerformHttpRequest(url, timeout_sec, NULL);
+}
+
+// 接口 2: 带 Token 的请求 (用于 GitHub API)
+char* NetRequest(const char* url, const char* token) {
+    return PerformHttpRequest(url, 15, token); // 默认 15秒超时
+}
+
+// 接口 3: 连通性检查
 bool NetCheckConnection(const char* url, const char* proxy, int timeout) {
     char* res = HttpGet(url, proxy, timeout);
     if (res) {
