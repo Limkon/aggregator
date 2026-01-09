@@ -1,6 +1,6 @@
 /* src/utils_net.c */
 #include "common.h"
-#include "utils_net.h" // 确保包含自身头文件
+#include "utils_net.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,9 +16,9 @@
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "crypt32.lib")
 
-// --- 全局状态变量 (参考 MandalaECH 的原子性设计) ---
+// --- 全局状态变量 ---
 static SSL_CTX* g_ssl_ctx = NULL;
-static volatile LONG s_ctxInitState = 0; // 0=Uninit, 1=Initializing, 2=Done
+static volatile LONG s_ctxInitState = 0; 
 static volatile LONG s_active_requests = 0;
 static volatile BOOL s_is_cleaning_up = FALSE;
 
@@ -45,7 +45,12 @@ static BOOL ParseUrl(const char* url, URL_COMPONENTS_SIMPLE* out) {
         p += 8;
         out->port = 443;
     }
-    else return FALSE;
+    else {
+        // 尝试容错，如果没写协议头，默认 HTTP 或根据端口判断? 
+        // 这里简单处理：假设直接是 host:port 或 host
+        strcpy_s(out->scheme, sizeof(out->scheme), "http");
+        // p 保持不变
+    }
 
     const char* slash = strchr(p, '/');
     int hostLen = slash ? (int)(slash - p) : (int)strlen(p);
@@ -72,12 +77,11 @@ static BOOL ParseUrl(const char* url, URL_COMPONENTS_SIMPLE* out) {
     return TRUE;
 }
 
-// 辅助函数：初始化 SSL (参考 MandalaECH 的单例模式)
+// 初始化 SSL (保持不变)
 static BOOL InitSSLContext() {
     if (g_ssl_ctx != NULL) return TRUE;
 
     if (InterlockedCompareExchange(&s_ctxInitState, 1, 0) == 0) {
-        // 再次检查清理标志
         if (s_is_cleaning_up) {
             InterlockedExchange(&s_ctxInitState, 0);
             return FALSE;
@@ -87,17 +91,13 @@ static BOOL InitSSLContext() {
         SSL_CTX* ctx = SSL_CTX_new(method);
 
         if (ctx) {
-            // 加载 CA 证书，增强安全性
             if (SSL_CTX_load_verify_locations(ctx, "cacert.pem", NULL) != 1) {
                 if (SSL_CTX_load_verify_locations(ctx, "resources/cacert.pem", NULL) != 1) {
-                    // Log: Warning, cacert not found
                     SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
-                }
-                else {
+                } else {
                     SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
                 }
-            }
-            else {
+            } else {
                 SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
             }
 
@@ -111,14 +111,11 @@ static BOOL InitSSLContext() {
             }
             LeaveCriticalSection(&g_dataLock);
             return (g_ssl_ctx != NULL);
-        }
-        else {
+        } else {
             InterlockedExchange(&s_ctxInitState, 0);
             return FALSE;
         }
-    }
-    else {
-        // 等待初始化完成
+    } else {
         int wait_loops = 0;
         while (s_ctxInitState == 1 && wait_loops < 200) {
             Sleep(10);
@@ -128,32 +125,35 @@ static BOOL InitSSLContext() {
     }
 }
 
-// --- 核心网络请求 (移植自 MandalaECH InternalHttpsGet，增加 Headers 解析支持) ---
-// 该函数使用 select 实现非阻塞超时，比原本的 SO_RCVTIMEO 更稳定
-static char* InternalRequest(const char* url, int timeout_ms, const char* auth_token, char* out_location, int loc_size) {
-    if (s_is_cleaning_up) return NULL;
-    InterlockedIncrement(&s_active_requests);
-
-    char* result = NULL;
+// [New] 建立 TCP 连接 (支持通过 HTTP 代理隧道)
+// 返回连接好的 socket，若失败返回 INVALID_SOCKET
+static SOCKET ConnectWithProxy(const char* host, int port, const char* proxy_url, int timeout_ms) {
     SOCKET s = INVALID_SOCKET;
-    SSL* ssl = NULL;
-    char* buf = NULL;
-    struct addrinfo* res = NULL;
-
-    URL_COMPONENTS_SIMPLE u;
-    if (!ParseUrl(url, &u)) goto cleanup;
-
-    BOOL is_https = (strcmp(u.scheme, "https") == 0);
-    if (is_https && !InitSSLContext()) goto cleanup;
-
     struct addrinfo hints = { 0 };
+    struct addrinfo* res = NULL;
+    char portStr[16];
+    
+    char targetHost[256];
+    int targetPort;
+    
+    // 1. 解析目标地址
+    // 如果有代理，我们连接代理的 IP；如果没有，连接目标的 IP
+    URL_COMPONENTS_SIMPLE proxyInfo;
+    BOOL useProxy = (proxy_url && strlen(proxy_url) > 0 && ParseUrl(proxy_url, &proxyInfo));
+    
+    if (useProxy) {
+        strncpy(targetHost, proxyInfo.host, sizeof(targetHost)-1);
+        targetPort = proxyInfo.port;
+    } else {
+        strncpy(targetHost, host, sizeof(targetHost)-1);
+        targetPort = port;
+    }
+
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
-    char portStr[16];
-    snprintf(portStr, sizeof(portStr), "%d", u.port);
+    snprintf(portStr, sizeof(portStr), "%d", targetPort);
 
-    // DNS 解析 (阻塞，但受限于系统超时)
-    if (getaddrinfo(u.host, portStr, &hints, &res) != 0) goto cleanup;
+    if (getaddrinfo(targetHost, portStr, &hints, &res) != 0) return INVALID_SOCKET;
 
     struct addrinfo* ptr = NULL;
     for (ptr = res; ptr != NULL; ptr = ptr->ai_next) {
@@ -161,8 +161,8 @@ static char* InternalRequest(const char* url, int timeout_ms, const char* auth_t
         s = socket(ptr->ai_family, ptr->ai_socktype, ptr->ai_protocol);
         if (s == INVALID_SOCKET) continue;
 
-        // 设置较短的连接超时 (3秒)
-        DWORD conn_timeout = 3000;
+        // 设置连接超时
+        DWORD conn_timeout = (timeout_ms > 3000) ? 3000 : timeout_ms;
         setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&conn_timeout, sizeof(conn_timeout));
         setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&conn_timeout, sizeof(conn_timeout));
 
@@ -170,8 +170,62 @@ static char* InternalRequest(const char* url, int timeout_ms, const char* auth_t
         closesocket(s);
         s = INVALID_SOCKET;
     }
+    freeaddrinfo(res);
 
+    if (s == INVALID_SOCKET) return INVALID_SOCKET;
+
+    // 2. 如果使用代理，发送 HTTP CONNECT 指令建立隧道
+    if (useProxy) {
+        char connectReq[512];
+        snprintf(connectReq, sizeof(connectReq), 
+            "CONNECT %s:%d HTTP/1.1\r\n"
+            "Host: %s:%d\r\n"
+            "Proxy-Connection: Keep-Alive\r\n\r\n",
+            host, port, host, port);
+        
+        if (send(s, connectReq, (int)strlen(connectReq), 0) <= 0) {
+            closesocket(s);
+            return INVALID_SOCKET;
+        }
+
+        // 读取代理响应 (简易处理，等待 200 Connection Established)
+        char respBuf[1024];
+        int n = recv(s, respBuf, sizeof(respBuf)-1, 0);
+        if (n <= 0) {
+            closesocket(s);
+            return INVALID_SOCKET;
+        }
+        respBuf[n] = 0;
+        
+        if (!strstr(respBuf, " 200 ")) { // 检查 HTTP 200
+            closesocket(s);
+            return INVALID_SOCKET;
+        }
+    }
+
+    return s;
+}
+
+// 核心请求函数 (已更新：支持 Proxy 参数)
+static char* InternalRequest(const char* url, int timeout_ms, const char* auth_token, const char* proxy, char* out_location, int loc_size) {
+    if (s_is_cleaning_up) return NULL;
+    InterlockedIncrement(&s_active_requests);
+
+    char* result = NULL;
+    SOCKET s = INVALID_SOCKET;
+    SSL* ssl = NULL;
+    char* buf = NULL;
+
+    URL_COMPONENTS_SIMPLE u;
+    if (!ParseUrl(url, &u)) goto cleanup;
+
+    BOOL is_https = (strcmp(u.scheme, "https") == 0);
+    if (is_https && !InitSSLContext()) goto cleanup;
+
+    // [Update] 使用支持代理的连接函数
+    s = ConnectWithProxy(u.host, u.port, proxy, timeout_ms);
     if (s == INVALID_SOCKET) goto cleanup;
+
     if (s_is_cleaning_up) goto cleanup;
 
     // SSL 握手
@@ -189,7 +243,6 @@ static char* InternalRequest(const char* url, int timeout_ms, const char* auth_t
         snprintf(extra_headers, sizeof(extra_headers), "Authorization: Bearer %s\r\n", auth_token);
     }
 
-    // 使用 MandalaECH 的 User-Agent 和 Headers 风格
     char req[4096];
     snprintf(req, sizeof(req),
         "GET %s HTTP/1.1\r\n"
@@ -204,7 +257,7 @@ static char* InternalRequest(const char* url, int timeout_ms, const char* auth_t
     int written = is_https ? SSL_write(ssl, req, req_len) : send(s, req, req_len, 0);
     if (written <= 0) goto cleanup;
 
-    // 准备读取 (切换为非阻塞模式以精确控制 Read Timeout)
+    // 准备读取 (非阻塞)
     unsigned long on = 1;
     ioctlsocket(s, FIONBIO, &on);
 
@@ -217,11 +270,11 @@ static char* InternalRequest(const char* url, int timeout_ms, const char* auth_t
 
     while (buf && !s_is_cleaning_up) {
         ULONGLONG now = GetTickCount64();
-        if (now - tick_start > (ULONGLONG)timeout_ms) break; // 超时
+        if (now - tick_start > (ULONGLONG)timeout_ms) break;
 
         if (total_len >= total_cap - 1024) {
             size_t new_cap = total_cap * 2;
-            if (new_cap > 8 * 1024 * 1024) break; // 限制 8MB
+            if (new_cap > 8 * 1024 * 1024) break; 
             char* new_buf = (char*)realloc(buf, new_cap);
             if (!new_buf) break;
             buf = new_buf;
@@ -238,7 +291,6 @@ static char* InternalRequest(const char* url, int timeout_ms, const char* auth_t
         if (n > 0) {
             total_len += n;
         } else {
-            // 处理非阻塞错误
             int should_retry = 0;
             if (is_https) {
                 int err = SSL_get_error(ssl, n);
@@ -248,7 +300,6 @@ static char* InternalRequest(const char* url, int timeout_ms, const char* auth_t
             }
 
             if (should_retry) {
-                // 使用 select 等待，避免空转 (CPU Friendly)
                 long long remaining = (long long)timeout_ms - (long long)(GetTickCount64() - tick_start);
                 if (remaining <= 0) break;
 
@@ -258,7 +309,6 @@ static char* InternalRequest(const char* url, int timeout_ms, const char* auth_t
                 struct timeval tv;
                 tv.tv_sec = (long)(remaining / 1000);
                 tv.tv_usec = (long)((remaining % 1000) * 1000);
-                // 限制每次 select 最多 100ms 以便检查 cleaning 标志
                 if (tv.tv_sec > 0 || tv.tv_usec > 100000) { tv.tv_sec = 0; tv.tv_usec = 100000; }
                 
                 select(0, &r_fds, NULL, NULL, &tv);
@@ -273,7 +323,6 @@ static char* InternalRequest(const char* url, int timeout_ms, const char* auth_t
         buf[total_len] = 0;
         int status_code = 0;
         if (sscanf(buf, "HTTP/%*d.%*d %d", &status_code) == 1) {
-            // 处理 3xx 重定向
             if (status_code >= 300 && status_code < 400 && out_location) {
                 char* loc = strstr(buf, "\nLocation:");
                 if (!loc) loc = strstr(buf, "\nlocation:");
@@ -290,7 +339,6 @@ static char* InternalRequest(const char* url, int timeout_ms, const char* auth_t
                     }
                 }
             }
-            // 处理 200 OK
             else if (status_code == 200) {
                 char* body_start = strstr(buf, "\r\n\r\n");
                 if (body_start) {
@@ -308,15 +356,14 @@ static char* InternalRequest(const char* url, int timeout_ms, const char* auth_t
 
 cleanup:
     if (buf) free(buf);
-    if (res) freeaddrinfo(res);
     if (ssl) SSL_free(ssl);
     if (s != INVALID_SOCKET) closesocket(s);
     InterlockedDecrement(&s_active_requests);
     return result;
 }
 
-// 通用 HTTP 请求处理（含重定向逻辑 - 保留原功能）
-static char* PerformHttpRequest(const char* url, int timeout_sec, const char* token) {
+// 通用 HTTP 请求处理（含重定向 + 代理传递）
+static char* PerformHttpRequest(const char* url, int timeout_sec, const char* token, const char* proxy) {
     if (s_is_cleaning_up) return NULL;
     
     char current_url[MAX_URL_LEN];
@@ -326,8 +373,8 @@ static char* PerformHttpRequest(const char* url, int timeout_sec, const char* to
     int redirects = 0;
     while (redirects < 5 && !s_is_cleaning_up) {
         char location[MAX_URL_LEN] = { 0 };
-        // 调用重构后的核心请求函数
-        char* result = InternalRequest(current_url, timeout_sec * 1000, token, location, sizeof(location));
+        // [Update] 传入 Proxy 参数
+        char* result = InternalRequest(current_url, timeout_sec * 1000, token, proxy, location, sizeof(location));
 
         if (result) {
             final_result = result;
@@ -335,17 +382,13 @@ static char* PerformHttpRequest(const char* url, int timeout_sec, const char* to
         }
 
         if (location[0] != 0) {
-            // 构建新的重定向 URL
             if (strncmp(location, "http", 4) != 0) {
                 if (location[0] == '/') {
                     URL_COMPONENTS_SIMPLE u;
                     ParseUrl(current_url, &u);
                     snprintf(current_url, sizeof(current_url), "%s://%s%s", u.scheme, u.host, location);
                 }
-                else {
-                    // 相对路径处理复杂，暂时忽略，仅支持完整 URL 或根路径
-                    break; 
-                }
+                else break;
             }
             else {
                 strncpy(current_url, location, sizeof(current_url) - 1);
@@ -361,15 +404,15 @@ static char* PerformHttpRequest(const char* url, int timeout_sec, const char* to
     return final_result;
 }
 
-// 接口 1: 普通下载
+// 接口 1: 普通下载 (现已支持代理)
 char* HttpGet(const char* url, const char* proxy, int timeout_sec) {
-    // 代理功能暂未在此层实现，MandalaECH 也是直连下载
-    return PerformHttpRequest(url, timeout_sec, NULL);
+    return PerformHttpRequest(url, timeout_sec, NULL, proxy);
 }
 
-// 接口 2: 带 Token 的请求
+// 接口 2: 带 Token 的请求 (不使用代理或需手动透传，这里暂时为 NULL)
 char* NetRequest(const char* url, const char* token) {
-    return PerformHttpRequest(url, 15, token);
+    // 搜索通常不需要代理，或者可以扩展
+    return PerformHttpRequest(url, 15, token, NULL);
 }
 
 // 接口 3: 连通性检查
@@ -382,16 +425,12 @@ bool NetCheckConnection(const char* url, const char* proxy, int timeout) {
     return false;
 }
 
-// 资源清理 (参考 MandalaECH 的安全退出机制)
 void CleanupUtilsNet() {
     s_is_cleaning_up = TRUE;
-    
-    // 等待活跃请求归零，防止 Crash
     for (int i = 0; i < 200; i++) {
         if (InterlockedCompareExchange(&s_active_requests, 0, 0) == 0) break;
         Sleep(10);
     }
-    
     EnterCriticalSection(&g_dataLock);
     if (g_ssl_ctx) {
         SSL_CTX_free(g_ssl_ctx);
