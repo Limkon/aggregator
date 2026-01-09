@@ -46,36 +46,40 @@ static int ExtractNodesFromText(char* text, char* out_buf, size_t buf_max, size_
     return count;
 }
 
-// --- 搜索任务线程入口 ---
-DWORD WINAPI SearchThreadProc(LPVOID lpParam) {
+// --- 搜索逻辑实现 ---
+// 对应 aggregator_core.c 中的 extern 声明
+void SearchGitHubKeywords(const char* token, const char* query, int pages, HWND hNotify) {
     // 1. 初始化
     char logBuf[512];
-    snprintf(logBuf, sizeof(logBuf), "搜索线程启动，关键字: %s, 页数: %d", 
-             g_config.search_keywords, g_config.search_pages);
-    PostMessage(g_hMainWnd, WM_APP_LOG, 0, (LPARAM)strdup(logBuf));
+    snprintf(logBuf, sizeof(logBuf), "搜索任务启动，关键字: %s, 页数: %d", 
+             query ? query : "", pages);
+    PostMessage(hNotify, WM_APP_LOG, 0, (LPARAM)strdup(logBuf));
 
-    // [修复] 不要直接修改 g_config.search_keywords，使用副本
-    char* kw_copy = strdup(g_config.search_keywords);
+    if (!query || strlen(query) == 0) {
+        PostMessage(hNotify, WM_APP_LOG, 0, (LPARAM)strdup("错误: 未指定搜索关键字"));
+        return;
+    }
+
+    // [修复] 不要直接修改 query，使用副本
+    char* kw_copy = strdup(query);
     char* keywords[10];
     int kw_count = 0;
     char* ctx_token = NULL;
-    char* token = strtok_s(kw_copy, ",", &ctx_token);
-    while (token && kw_count < 10) {
-        keywords[kw_count++] = token;
-        token = strtok_s(NULL, ",", &ctx_token);
+    char* k_token = strtok_s(kw_copy, ",", &ctx_token);
+    while (k_token && kw_count < 10) {
+        keywords[kw_count++] = k_token;
+        k_token = strtok_s(NULL, ",", &ctx_token);
     }
 
     if (kw_count == 0) {
-        PostMessage(g_hMainWnd, WM_APP_LOG, 0, (LPARAM)strdup("错误: 未指定搜索关键字"));
         free(kw_copy);
-        PostMessage(g_hMainWnd, WM_APP_TASK_DONE, 0, 0);
-        return 0;
+        return;
     }
 
     // 结果缓冲区 (1MB)
     size_t total_buf_size = 1024 * 1024; 
     char* result_buffer = (char*)malloc(total_buf_size);
-    if (!result_buffer) { free(kw_copy); return 0; }
+    if (!result_buffer) { free(kw_copy); return; }
     result_buffer[0] = 0;
     size_t current_len = 0;
     
@@ -95,11 +99,11 @@ DWORD WINAPI SearchThreadProc(LPVOID lpParam) {
     // 3. 开始循环搜索
     for (int k = 0; k < kw_count; k++) {
         for (int e = 0; e < ext_count; e++) { // 遍历扩展名
-            for (int page = 1; page <= g_config.search_pages; page++) {
+            for (int page = 1; page <= pages; page++) {
                 
                 // 检查停止信号
                 if (WaitForSingleObject(g_hStopEvent, 0) == WAIT_OBJECT_0) {
-                    PostMessage(g_hMainWnd, WM_APP_LOG, 0, (LPARAM)strdup("搜索已中止"));
+                    PostMessage(hNotify, WM_APP_LOG, 0, (LPARAM)strdup("搜索已中止"));
                     goto cleanup;
                 }
 
@@ -110,15 +114,16 @@ DWORD WINAPI SearchThreadProc(LPVOID lpParam) {
                     keywords[k], extensions[e], page);
                 
                 snprintf(logBuf, sizeof(logBuf), "搜索: %s (Ext: %s, 页 %d)", keywords[k], extensions[e], page);
-                PostMessage(g_hMainWnd, WM_APP_LOG, 0, (LPARAM)strdup(logBuf));
+                PostMessage(hNotify, WM_APP_LOG, 0, (LPARAM)strdup(logBuf));
 
                 // 发起 HTTP 请求
-                char* response = NetRequest(url, g_config.github_token[0] ? g_config.github_token : NULL);
+                const char* api_token = (token && token[0]) ? token : NULL;
+                char* response = NetRequest(url, api_token);
                 
                 if (!response) {
                     // 如果没有 Token，GitHub 很容易 403，不要立即放弃，可能只是限流
                     snprintf(logBuf, sizeof(logBuf), "请求失败 (可能触发限流，等待中...)");
-                    PostMessage(g_hMainWnd, WM_APP_LOG, 0, (LPARAM)strdup(logBuf));
+                    PostMessage(hNotify, WM_APP_LOG, 0, (LPARAM)strdup(logBuf));
                     Sleep(2000); 
                     continue;
                 }
@@ -138,11 +143,15 @@ DWORD WINAPI SearchThreadProc(LPVOID lpParam) {
                     }
 
                     snprintf(logBuf, sizeof(logBuf), "  > 发现 %d 个文件", count);
-                    PostMessage(g_hMainWnd, WM_APP_LOG, 0, (LPARAM)strdup(logBuf));
+                    PostMessage(hNotify, WM_APP_LOG, 0, (LPARAM)strdup(logBuf));
 
                     for (int i = 0; i < count; i++) {
                         // 再次检查停止
-                        if (WaitForSingleObject(g_hStopEvent, 0) == WAIT_OBJECT_0) goto cleanup;
+                        if (WaitForSingleObject(g_hStopEvent, 0) == WAIT_OBJECT_0) {
+                            cJSON_Delete(root);
+                            free(response);
+                            goto cleanup;
+                        }
 
                         cJSON* item = cJSON_GetArrayItem(items, i);
                         cJSON* html_url = cJSON_GetObjectItem(item, "html_url");
@@ -178,12 +187,12 @@ DWORD WINAPI SearchThreadProc(LPVOID lpParam) {
                                             free(decoded);
                                             if (found > 0) {
                                                  snprintf(logBuf, sizeof(logBuf), "    + 经Base64解码提取到 %d 个节点", found);
-                                                 PostMessage(g_hMainWnd, WM_APP_LOG, 0, (LPARAM)strdup(logBuf));
+                                                 PostMessage(hNotify, WM_APP_LOG, 0, (LPARAM)strdup(logBuf));
                                             }
                                         }
                                     } else {
                                         snprintf(logBuf, sizeof(logBuf), "    + 直接提取到 %d 个节点", found);
-                                        PostMessage(g_hMainWnd, WM_APP_LOG, 0, (LPARAM)strdup(logBuf));
+                                        PostMessage(hNotify, WM_APP_LOG, 0, (LPARAM)strdup(logBuf));
                                     }
 
                                     free(file_content);
@@ -202,16 +211,10 @@ DWORD WINAPI SearchThreadProc(LPVOID lpParam) {
 
     // 4. 更新 UI
     SetSubsInputText(result_buffer);
-    PostMessage(g_hMainWnd, WM_APP_LOG, 0, (LPARAM)strdup("搜索任务完成，结果已填入订阅框"));
+    PostMessage(hNotify, WM_APP_LOG, 0, (LPARAM)strdup("搜索任务完成，结果已填入订阅框"));
 
 cleanup:
     if (kw_copy) free(kw_copy);
     if (result_buffer) free(result_buffer);
-    PostMessage(g_hMainWnd, WM_APP_TASK_DONE, 0, 0);
-    return 0;
-}
-
-void StartSearchTask() {
-    g_hStopEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
-    CreateThread(NULL, 0, SearchThreadProc, NULL, 0, NULL);
+    // 注意：不要发送 WM_APP_TASK_DONE，因为调用者 aggregator_core.c 会发送
 }
