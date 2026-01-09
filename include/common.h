@@ -1,6 +1,8 @@
 #ifndef COMMON_H
 #define COMMON_H
 
+// 必须在 windows.h 之前包含 winsock2.h 以避免冲突警告
+#include <winsock2.h>
 #include <windows.h>
 #include <stdbool.h>
 
