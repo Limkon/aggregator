@@ -16,12 +16,13 @@
 
 // --- 全局状态变量 ---
 static SSL_CTX* g_ssl_ctx = NULL;
-static volatile LONG s_ctxInitState = 0; // 0=Uninit, 1=Initializing, 2=Done
-static volatile LONG s_active_requests = 0; // 活跃请求计数
-static volatile BOOL s_is_cleaning_up = FALSE; // 清理标志
+static volatile LONG s_ctxInitState = 0; 
+static volatile LONG s_active_requests = 0; 
+static volatile BOOL s_is_cleaning_up = FALSE; 
 
 // --- 简单的 URL 解析结构 ---
 typedef struct { 
+    char scheme[16];
     char host[256]; 
     int port; 
     char path[2048]; 
@@ -33,8 +34,16 @@ static BOOL ParseUrl(const char* url, URL_COMPONENTS_SIMPLE* out) {
     memset(out, 0, sizeof(URL_COMPONENTS_SIMPLE));
     
     const char* p = url;
-    if (strncmp(p, "http://", 7) == 0) { p += 7; out->port = 80; }
-    else if (strncmp(p, "https://", 8) == 0) { p += 8; out->port = 443; }
+    if (strncmp(p, "http://", 7) == 0) { 
+        strcpy(out->scheme, "http");
+        p += 7; 
+        out->port = 80; 
+    }
+    else if (strncmp(p, "https://", 8) == 0) { 
+        strcpy(out->scheme, "https");
+        p += 8; 
+        out->port = 443; 
+    }
     else return FALSE;
     
     // 查找 Host 结束位置
@@ -64,22 +73,19 @@ static BOOL ParseUrl(const char* url, URL_COMPONENTS_SIMPLE* out) {
     return TRUE;
 }
 
-// 辅助函数：初始化全局 SSL Context (单例模式)
+// 辅助函数：初始化全局 SSL Context
 static BOOL InitSSLContext() {
-    // 双重检查锁定 (Double-Checked Locking) 优化
     if (g_ssl_ctx != NULL) return TRUE;
 
     if (InterlockedCompareExchange(&s_ctxInitState, 1, 0) == 0) {
-        // 获取了初始化锁
         const SSL_METHOD* method = TLS_client_method();
         SSL_CTX* ctx = SSL_CTX_new(method);
         
         if (ctx) {
-            // 尝试加载证书 (优先当前目录，其次 resources 目录)
+            // 加载系统默认证书库或指定文件
             if (SSL_CTX_load_verify_locations(ctx, "cacert.pem", NULL) != 1) {
                 if (SSL_CTX_load_verify_locations(ctx, "resources/cacert.pem", NULL) != 1) {
-                    // 如果找不到证书，为了保证可用性，临时禁用验证并打印警告
-                    // GuiAppendLog("[Net] Warning: cacert.pem not found. SSL verification disabled.");
+                    // 找不到证书时，临时禁用验证以保证功能可用
                     SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
                 } else {
                     SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
@@ -91,15 +97,13 @@ static BOOL InitSSLContext() {
             EnterCriticalSection(&g_dataLock);
             g_ssl_ctx = ctx;
             LeaveCriticalSection(&g_dataLock);
-            
-            InterlockedExchange(&s_ctxInitState, 2); // 标记初始化完成
+            InterlockedExchange(&s_ctxInitState, 2); 
             return TRUE;
         } else {
-            InterlockedExchange(&s_ctxInitState, 0); // 初始化失败
+            InterlockedExchange(&s_ctxInitState, 0); 
             return FALSE;
         }
     } else {
-        // 其他线程正在初始化，等待完成
         int wait_loops = 0;
         while (s_ctxInitState == 1 && wait_loops < 200) {
             Sleep(10);
@@ -109,44 +113,39 @@ static BOOL InitSSLContext() {
     }
 }
 
-// 核心函数：执行 HTTPS GET 请求
-// 对应 MandalaECH 的 InternalHttpsGet
-char* HttpGet(const char* url, const char* proxy, int timeout_sec) {
+// 内部函数：单次请求，返回 Body 或 Location Header
+static char* InternalRequest(const char* url, int timeout_sec, char* out_location, int loc_size) {
     if (s_is_cleaning_up) return NULL;
-    InterlockedIncrement(&s_active_requests);
-
-    char* result = NULL;
+    
     SOCKET s = INVALID_SOCKET;
     SSL* ssl = NULL;
     struct addrinfo* res = NULL;
     char* buf = NULL;
+    char* result = NULL;
     
-    // 1. 解析 URL
     URL_COMPONENTS_SIMPLE u;
-    if (!ParseUrl(url, &u)) goto cleanup;
+    if (!ParseUrl(url, &u)) return NULL;
 
-    // 2. 初始化 SSL 环境
-    if (!InitSSLContext()) goto cleanup;
+    // 1. SSL 初始化 (仅 HTTPS 需要)
+    BOOL is_https = (strcmp(u.scheme, "https") == 0);
+    if (is_https && !InitSSLContext()) return NULL;
 
-    // 3. DNS 解析
-    // 注意：如果有代理设置，这里逻辑需要调整 (MandalaECH 此处暂未处理 HTTP 代理链)
-    // 为保持与 MandalaECH 一致性，暂不实现 HTTP Tunnel 代理逻辑，仅直连
+    // 2. DNS 解析
     struct addrinfo hints = {0};
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
     char portStr[16];
     snprintf(portStr, sizeof(portStr), "%d", u.port);
 
-    if (getaddrinfo(u.host, portStr, &hints, &res) != 0) goto cleanup;
+    if (getaddrinfo(u.host, portStr, &hints, &res) != 0) return NULL;
 
-    // 4. 建立 TCP 连接
+    // 3. 建立连接
     struct addrinfo* ptr = NULL;
     for (ptr = res; ptr != NULL; ptr = ptr->ai_next) {
         if (s_is_cleaning_up) break;
         s = socket(ptr->ai_family, ptr->ai_socktype, ptr->ai_protocol);
         if (s == INVALID_SOCKET) continue;
 
-        // 设置超时
         DWORD time_ms = timeout_sec * 1000;
         setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&time_ms, sizeof(time_ms));
         setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&time_ms, sizeof(time_ms));
@@ -156,86 +155,112 @@ char* HttpGet(const char* url, const char* proxy, int timeout_sec) {
         s = INVALID_SOCKET;
     }
 
-    if (s == INVALID_SOCKET) goto cleanup;
-
-    // 5. 建立 SSL 握手
-    ssl = SSL_new(g_ssl_ctx);
-    if (!ssl) goto cleanup;
-
-    SSL_set_fd(ssl, (int)s);
-    SSL_set_tlsext_host_name(ssl, u.host); // SNI 支持
-
-    if (SSL_connect(ssl) != 1) {
-        // Handshake failed
-        goto cleanup;
+    if (s == INVALID_SOCKET) {
+        freeaddrinfo(res);
+        return NULL;
     }
 
-    // 6. 发送 HTTP 请求
+    // 4. SSL 握手
+    if (is_https) {
+        ssl = SSL_new(g_ssl_ctx);
+        if (!ssl) goto cleanup;
+
+        SSL_set_fd(ssl, (int)s);
+        SSL_set_tlsext_host_name(ssl, u.host); 
+        if (SSL_connect(ssl) != 1) goto cleanup;
+    }
+
+    // 5. 发送请求
     char req[4096];
     snprintf(req, sizeof(req), 
         "GET %s HTTP/1.1\r\n"
         "Host: %s\r\n"
-        "User-Agent: ProxyAggregator/1.0\r\n"
+        "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36\r\n"
         "Connection: close\r\n"
         "\r\n", 
         u.path, u.host);
 
-    if (SSL_write(ssl, req, (int)strlen(req)) <= 0) goto cleanup;
+    int sent = is_https ? SSL_write(ssl, req, (int)strlen(req)) : send(s, req, (int)strlen(req), 0);
+    if (sent <= 0) goto cleanup;
 
-    // 7. 读取响应
-    size_t total_cap = 65536; // 64KB 初始容量
+    // 6. 读取响应
+    size_t total_cap = 65536; 
     size_t total_len = 0;
     buf = (char*)malloc(total_cap);
     if (!buf) goto cleanup;
 
     ULONGLONG tick_start = GetTickCount64();
-    
-    // 设置非阻塞以便自行控制超时逻辑 (MandalaECH 逻辑)
     unsigned long on = 1;
-    ioctlsocket(s, FIONBIO, &on);
+    ioctlsocket(s, FIONBIO, &on); // 非阻塞
 
     while (!s_is_cleaning_up) {
-        // 超时检查
         if (GetTickCount64() - tick_start > (ULONGLONG)(timeout_sec * 1000)) break;
 
-        // 扩容检查
         if (total_len >= total_cap - 1024) {
             size_t new_cap = total_cap * 2;
-            if (new_cap > 10 * 1024 * 1024) break; // 最大 10MB
+            if (new_cap > 10 * 1024 * 1024) break; 
             char* new_buf = (char*)realloc(buf, new_cap);
             if (!new_buf) break;
             buf = new_buf;
             total_cap = new_cap;
         }
 
-        int n = SSL_read(ssl, buf + total_len, (int)(total_cap - total_len - 1));
+        int n;
+        if (is_https) n = SSL_read(ssl, buf + total_len, (int)(total_cap - total_len - 1));
+        else n = recv(s, buf + total_len, (int)(total_cap - total_len - 1), 0);
         
         if (n > 0) {
             total_len += n;
         } else {
-            int err = SSL_get_error(ssl, n);
-            if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
-                Sleep(10); // 简单等待
-                continue;
+            if (is_https) {
+                int err = SSL_get_error(ssl, n);
+                if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) { Sleep(10); continue; }
+            } else {
+                if (WSAGetLastError() == WSAEWOULDBLOCK) { Sleep(10); continue; }
             }
-            if (n == 0) break; // EOF (连接关闭)
-            break; // Error
+            if (n == 0) break; 
+            break; 
         }
     }
 
-    // 8. 解析 HTTP Body (去除 Header)
+    // 7. 解析响应
     if (buf && total_len > 0) {
         buf[total_len] = 0;
-        // 简单判断 HTTP 200
-        if (strstr(buf, "HTTP/1.1 200") || strstr(buf, "HTTP/1.0 200")) {
-            char* body_start = strstr(buf, "\r\n\r\n");
-            if (body_start) {
-                body_start += 4;
-                size_t content_len = total_len - (body_start - buf);
-                result = (char*)malloc(content_len + 1);
-                if (result) {
-                    memcpy(result, body_start, content_len);
-                    result[content_len] = 0;
+        
+        // 检查状态码
+        int status_code = 0;
+        if (sscanf(buf, "HTTP/%*d.%*d %d", &status_code) == 1) {
+            
+            // 处理重定向 (301, 302, 307, 308)
+            if (status_code == 301 || status_code == 302 || status_code == 307 || status_code == 308) {
+                if (out_location) {
+                    char* loc = strstr(buf, "\nLocation:");
+                    if (!loc) loc = strstr(buf, "\nlocation:");
+                    if (loc) {
+                        loc += 10; // skip "\nLocation:"
+                        while (*loc == ' ' || *loc == '\t') loc++;
+                        char* end = strchr(loc, '\r');
+                        if (!end) end = strchr(loc, '\n');
+                        if (end) {
+                            int len = (int)(end - loc);
+                            if (len >= loc_size) len = loc_size - 1;
+                            strncpy(out_location, loc, len);
+                            out_location[len] = 0;
+                        }
+                    }
+                }
+            } 
+            // 处理成功 (200)
+            else if (status_code == 200) {
+                char* body_start = strstr(buf, "\r\n\r\n");
+                if (body_start) {
+                    body_start += 4;
+                    size_t content_len = total_len - (body_start - buf);
+                    result = (char*)malloc(content_len + 1);
+                    if (result) {
+                        memcpy(result, body_start, content_len);
+                        result[content_len] = 0;
+                    }
                 }
             }
         }
@@ -246,8 +271,57 @@ cleanup:
     if (res) freeaddrinfo(res);
     if (ssl) SSL_free(ssl);
     if (s != INVALID_SOCKET) closesocket(s);
-    InterlockedDecrement(&s_active_requests);
     return result;
+}
+
+// 核心函数：执行 GET 请求 (支持自动重定向)
+char* HttpGet(const char* url, const char* proxy, int timeout_sec) {
+    if (s_is_cleaning_up) return NULL;
+    InterlockedIncrement(&s_active_requests);
+
+    char current_url[MAX_URL_LEN];
+    strncpy(current_url, url, sizeof(current_url) - 1);
+    char* final_result = NULL;
+    
+    int redirects = 0;
+    while (redirects < 5) { // 最多允许 5 次重定向
+        char location[MAX_URL_LEN] = {0};
+        
+        // 发起请求
+        char* result = InternalRequest(current_url, timeout_sec, location, sizeof(location));
+        
+        // 如果有结果 (200 OK)，直接返回
+        if (result) {
+            final_result = result;
+            break;
+        }
+        
+        // 如果没有结果，但有 Location (重定向)
+        if (location[0] != 0) {
+            // 处理相对路径
+            if (strncmp(location, "http", 4) != 0) {
+                // 简单的相对路径拼接 (仅支持以 / 开头的绝对路径)
+                if (location[0] == '/') {
+                    URL_COMPONENTS_SIMPLE u;
+                    ParseUrl(current_url, &u);
+                    snprintf(current_url, sizeof(current_url), "%s://%s%s", u.scheme, u.host, location);
+                } else {
+                    // 复杂相对路径暂不支持，直接失败
+                    break;
+                }
+            } else {
+                strncpy(current_url, location, sizeof(current_url) - 1);
+            }
+            redirects++;
+            continue; // 重试新地址
+        } else {
+            // 既无结果也无重定向，失败
+            break;
+        }
+    }
+    
+    InterlockedDecrement(&s_active_requests);
+    return final_result;
 }
 
 // 连通性测试
@@ -263,13 +337,10 @@ bool NetCheckConnection(const char* url, const char* proxy, int timeout) {
 // 资源清理
 void CleanupUtilsNet() {
     s_is_cleaning_up = TRUE;
-    
-    // 等待活跃请求结束
-    for (int i = 0; i < 200; i++) { // 最多等待 2秒
+    for (int i = 0; i < 200; i++) { 
         if (InterlockedCompareExchange(&s_active_requests, 0, 0) == 0) break;
         Sleep(10);
     }
-
     EnterCriticalSection(&g_dataLock);
     if (g_ssl_ctx) {
         SSL_CTX_free(g_ssl_ctx);
