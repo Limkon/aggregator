@@ -19,7 +19,7 @@ extern double SpeedTest_Singbox(const char* node_link, int port_index, int timeo
 extern HWND g_hMainWnd; 
 static HANDLE hWorkerThread = NULL;
 
-// --- 线程参数结构体 (移至全局以兼容 MSVC) ---
+// --- 线程参数结构体 ---
 typedef void (*TaskCallback)(void* data, int thread_idx);
 
 typedef struct {
@@ -29,6 +29,11 @@ typedef struct {
     HANDLE hSem;
     volatile long* pActive;
 } ThreadArg;
+
+// --- 辅助：检查是否已中止 ---
+static BOOL IsTaskStopped() {
+    return WaitForSingleObject(g_hStopEvent, 0) == WAIT_OBJECT_0;
+}
 
 // --- 辅助：重置全局节点列表 ---
 static void ClearGlobalNodes() {
@@ -61,6 +66,7 @@ static int AddNodeSafe(const char* link) {
         ProxyNode* node = &g_nodes[g_node_count];
         memset(node, 0, sizeof(ProxyNode));
         node->id = g_node_count;
+        node->latency = -1.0; // [修复] 默认延迟初始化为 -1，避免被误认为 0ms
         strncpy(node->original_link, link, MAX_URL_LEN - 1);
         
         ParseNodeBasic(link, node);
@@ -87,44 +93,40 @@ unsigned int __stdcall SearchThreadProc(void* arg) {
 unsigned int __stdcall WorkerProc(void* p) {
     ThreadArg* arg = (ThreadArg*)p;
     
-    // 在开始具体工作前，再次检查是否已中止
+    // 在执行前再次检查停止信号
     if (WaitForSingleObject(g_hStopEvent, 0) != WAIT_OBJECT_0) {
         arg->cb(arg->item_ptr, arg->thread_idx);
     }
     
-    // 任务完成，递减活动计数，释放信号量
     InterlockedDecrement(arg->pActive);
     ReleaseSemaphore(arg->hSem, 1, NULL);
     free(arg);
     return 0;
 }
 
-// 并发任务执行器 (核心修复：解决停止时的死锁)
+// 并发任务执行器
 static void RunConcurrentTasks(void* items, int count, int item_size, TaskCallback callback, int concurrency) {
     if (count <= 0) return;
     
-    // 限制最大并发，防止系统卡死
     if (concurrency < 1) concurrency = 1;
     if (concurrency > 64) concurrency = 64; 
     
     HANDLE hSemaphore = CreateSemaphore(NULL, concurrency, concurrency, NULL);
     volatile long active_count = 0;
     
-    // 等待句柄数组：[0]=停止信号, [1]=资源信号量
     HANDLE waitHandles[2] = { g_hStopEvent, hSemaphore };
 
     for (int i = 0; i < count; i++) {
-        // [修复] 使用 WaitForMultipleObjects 同时监听 "停止" 和 "空闲名额"
-        // 只要有一个满足就返回，如果是停止信号，则立即退出循环
+        // 等待：要么有空位(Semaphore)，要么收到停止信号(StopEvent)
         DWORD waitResult = WaitForMultipleObjects(2, waitHandles, FALSE, INFINITE);
         
         if (waitResult == WAIT_OBJECT_0) {
-            // 收到 g_hStopEvent (索引0)，用户点击了中止
-            PostMessage(g_hMainWnd, WM_APP_LOG, 0, (LPARAM)_strdup(">>> 检测到中止信号，停止分发新任务..."));
-            break;
+            // 用户中止
+            PostMessage(g_hMainWnd, WM_APP_LOG, 0, (LPARAM)_strdup(">>> 中止信号已收到，停止分发新任务..."));
+            break; 
         }
         else if (waitResult == WAIT_OBJECT_0 + 1) {
-            // 收到 hSemaphore (索引1)，有空闲线程名额，继续执行
+            // 有空位
             InterlockedIncrement(&active_count);
             
             ThreadArg* arg = (ThreadArg*)malloc(sizeof(ThreadArg));
@@ -136,42 +138,30 @@ static void RunConcurrentTasks(void* items, int count, int item_size, TaskCallba
                 arg->pActive = &active_count;
                 
                 HANDLE hT = (HANDLE)_beginthreadex(NULL, 0, WorkerProc, arg, 0, NULL);
-                if (hT) {
-                    CloseHandle(hT); // 线程 detached 运行
-                } else {
-                    // 创建失败回滚
+                if (hT) CloseHandle(hT);
+                else {
                     InterlockedDecrement(&active_count);
                     ReleaseSemaphore(hSemaphore, 1, NULL);
                     free(arg);
                 }
             } else {
-                // 内存分配失败回滚
                 InterlockedDecrement(&active_count);
                 ReleaseSemaphore(hSemaphore, 1, NULL);
             }
             
-            // 每处理5个任务更新一次进度条或日志，减少界面刷新频率
             if (i % 5 == 0) PostMessage(g_hMainWnd, WM_APP_PROGRESS, i, count);
         }
         else {
-            // 等待失败 (如 WAIT_FAILED)，安全退出
-            break;
+            break; // 错误
         }
     }
     
-    // 等待所有正在运行的子任务完成 (Drain)
-    // 注意：这里必须等待，否则释放 hSemaphore 会导致子线程崩溃
-    // 但因为不再分发新任务，这里只会等待最多 1 个超时周期 (如10秒)
-    while (active_count > 0) {
-        Sleep(50);
-        // 可以选择在这里再次 check StopEvent 来强制 kill (不推荐，容易泄露资源)
-    }
-    
+    // 等待剩余活动线程结束
+    while (active_count > 0) Sleep(50);
     CloseHandle(hSemaphore);
 }
 
 // --- 子任务 A: 下载并解析订阅 ---
-
 typedef struct {
     char url[MAX_URL_LEN];
 } SubLink;
@@ -181,7 +171,6 @@ static char* CleanBase64(const char* input) {
     size_t len = strlen(input);
     char* clean = (char*)malloc(len + 1);
     if (!clean) return NULL;
-    
     size_t j = 0;
     for (size_t i = 0; i < len; i++) {
         if ((input[i] >= 'A' && input[i] <= 'Z') ||
@@ -198,7 +187,6 @@ static char* CleanBase64(const char* input) {
 void DownloadSubWorker(void* data, int idx) {
     SubLink* link = (SubLink*)data;
     char logBuf[512];
-    
     snprintf(logBuf, sizeof(logBuf), "[T-%d] 下载: %s", idx, link->url);
     PostMessage(g_hMainWnd, WM_APP_LOG, 0, (LPARAM)_strdup(logBuf));
     
@@ -208,8 +196,6 @@ void DownloadSubWorker(void* data, int idx) {
     if (content) {
         int added = 0;
         int original_len = (int)strlen(content);
-
-        // 智能探测：如果已经是明文，千万不要解码！
         BOOL is_plaintext = FALSE;
         if (strstr(content, "vmess://") || strstr(content, "ss://") || 
             strstr(content, "trojan://") || strstr(content, "vless://")) {
@@ -220,22 +206,18 @@ void DownloadSubWorker(void* data, int idx) {
         char* target = content;
 
         if (!is_plaintext) {
-            // 只有不包含协议头时，才尝试 Base64 解码
             char* clean_content = CleanBase64(content);
             if (clean_content && strlen(clean_content) > 0) {
                 decoded = Base64Decode(clean_content);
             }
             if (clean_content) free(clean_content);
-            
             if (decoded) target = decoded;
         }
 
-        // 2. 按行扫描
         char* ctx = NULL;
         char* line = strtok_s(target, "\n\r", &ctx);
         while (line) {
             while (*line && (*line == ' ' || *line == '\t')) line++;
-            
             if (*line) {
                 if (strncmp(line, "vmess://", 8) == 0 ||
                     strncmp(line, "vless://", 8) == 0 ||
@@ -243,7 +225,6 @@ void DownloadSubWorker(void* data, int idx) {
                     strncmp(line, "trojan://", 9) == 0 ||
                     strncmp(line, "hysteria2://", 12) == 0 ||
                     strncmp(line, "hy2://", 6) == 0) {
-                        
                     if (AddNodeSafe(line)) added++;
                 }
             }
@@ -252,11 +233,10 @@ void DownloadSubWorker(void* data, int idx) {
         
         if (decoded) free(decoded);
         free(content);
-        
-        snprintf(logBuf, sizeof(logBuf), "  -> [T-%d] 完成，大小: %d B, 解析: %d 个", idx, original_len, added);
+        snprintf(logBuf, sizeof(logBuf), "  -> [T-%d] 解析: %d 个", idx, added);
         PostMessage(g_hMainWnd, WM_APP_LOG, 0, (LPARAM)_strdup(logBuf));
     } else {
-        snprintf(logBuf, sizeof(logBuf), "  -> [T-%d] 下载失败 (超时或网络错误)", idx);
+        snprintf(logBuf, sizeof(logBuf), "  -> [T-%d] 下载失败", idx);
         PostMessage(g_hMainWnd, WM_APP_LOG, 0, (LPARAM)_strdup(logBuf));
     }
 }
@@ -264,31 +244,26 @@ void DownloadSubWorker(void* data, int idx) {
 // --- 子任务 B: 测速 ---
 void SpeedTestWorker(void* data, int idx) {
     ProxyNode* node = (ProxyNode*)data;
-    
     if (node->type == NODE_UNKNOWN && g_config.test_mode == TEST_MODE_TCP) {
-        node->latency = -1;
+        node->latency = -1.0;
         return;
     }
-    
-    double lat = -1;
+    double lat = -1.0;
     if (g_config.test_mode == TEST_MODE_TCP) {
         lat = SpeedTest_TcpPing(node->address, node->port, g_config.timeout);
     } else {
         lat = SpeedTest_Singbox(node->original_link, idx, g_config.timeout, g_config.test_url);
     }
-    
     node->latency = lat;
     node->is_alive = (lat >= 0);
 }
 
 // --- 主聚合流程 ---
 unsigned int __stdcall ProcessThreadProc(void* arg) {
-    // 1. 初始化
     ClearGlobalNodes();
     char* input_text = (char*)arg; 
     PostMessage(g_hMainWnd, WM_APP_LOG, 0, (LPARAM)_strdup("=== 开始聚合处理 ==="));
 
-    // 2. 解析输入
     SubLink* sub_links = (SubLink*)malloc(100 * sizeof(SubLink));
     int sub_count = 0;
     
@@ -313,15 +288,12 @@ unsigned int __stdcall ProcessThreadProc(void* arg) {
     snprintf(logBuf, sizeof(logBuf), "直接节点: %d, 订阅链接: %d", g_node_count, sub_count);
     PostMessage(g_hMainWnd, WM_APP_LOG, 0, (LPARAM)_strdup(logBuf));
     
-    // 3. 执行订阅下载 (支持中断)
-    if (sub_count > 0) {
+    // [阶段 1] 订阅下载 (如果未中止)
+    if (sub_count > 0 && !IsTaskStopped()) {
         PostMessage(g_hMainWnd, WM_APP_LOG, 0, (LPARAM)_strdup("--- 开始下载订阅 ---"));
         RunConcurrentTasks(sub_links, sub_count, sizeof(SubLink), DownloadSubWorker, g_config.concurrency);
     }
     free(sub_links);
-    
-    // 检查是否已中止
-    if (WaitForSingleObject(g_hStopEvent, 0) == WAIT_OBJECT_0) goto cleanup;
 
     snprintf(logBuf, sizeof(logBuf), "总节点数: %d", g_node_count);
     PostMessage(g_hMainWnd, WM_APP_LOG, 0, (LPARAM)_strdup(logBuf));
@@ -331,8 +303,9 @@ unsigned int __stdcall ProcessThreadProc(void* arg) {
         goto cleanup;
     }
 
-    // 4. 执行测速 (支持中断)
-    if (g_config.enable_speedtest) {
+    // [阶段 2] 测速 (如果启用 且 未中止)
+    // 关键逻辑变更：如果中止，我们仅仅跳过测速，但继续执行后面的结果生成
+    if (g_config.enable_speedtest && !IsTaskStopped()) {
         char modeStr[64];
         snprintf(modeStr, sizeof(modeStr), "--- 开始测速 (%s, 并发 %d) ---", 
             g_config.test_mode == TEST_MODE_TCP ? "TCP Ping" : "Sing-box", 
@@ -341,44 +314,63 @@ unsigned int __stdcall ProcessThreadProc(void* arg) {
         
         RunConcurrentTasks(g_nodes, g_node_count, sizeof(ProxyNode), SpeedTestWorker, g_config.concurrency);
         
-        // 再次检查中止，如果中止了就不进行排序和输出了
-        if (WaitForSingleObject(g_hStopEvent, 0) == WAIT_OBJECT_0) goto cleanup;
-
-        int NodeCompare(const void* a, const void* b) {
-            ProxyNode* na = (ProxyNode*)a;
-            ProxyNode* nb = (ProxyNode*)b;
-            if (na->latency < 0 && nb->latency < 0) return 0;
-            if (na->latency < 0) return 1;
-            if (nb->latency < 0) return -1;
-            return (na->latency > nb->latency) ? 1 : -1;
+        // 如果测速期间被中止，跳过排序，直接输出
+        if (!IsTaskStopped()) {
+            int NodeCompare(const void* a, const void* b) {
+                ProxyNode* na = (ProxyNode*)a;
+                ProxyNode* nb = (ProxyNode*)b;
+                if (na->latency < 0 && nb->latency < 0) return 0;
+                if (na->latency < 0) return 1; // 失败的放后面
+                if (nb->latency < 0) return -1;
+                return (na->latency > nb->latency) ? 1 : -1;
+            }
+            qsort(g_nodes, g_node_count, sizeof(ProxyNode), NodeCompare);
+            
+            int alive = 0;
+            for (int i=0; i<g_node_count; i++) if(g_nodes[i].latency >= 0) alive++;
+            snprintf(logBuf, sizeof(logBuf), "测速完成。存活节点: %d", alive);
+            PostMessage(g_hMainWnd, WM_APP_LOG, 0, (LPARAM)_strdup(logBuf));
+        } else {
+             PostMessage(g_hMainWnd, WM_APP_LOG, 0, (LPARAM)_strdup("测速已中止，保留现有结果..."));
         }
-        qsort(g_nodes, g_node_count, sizeof(ProxyNode), NodeCompare);
-        
-        int alive = 0;
-        for (int i=0; i<g_node_count; i++) if(g_nodes[i].latency >= 0) alive++;
-        snprintf(logBuf, sizeof(logBuf), "测速完成。存活节点: %d", alive);
-        PostMessage(g_hMainWnd, WM_APP_LOG, 0, (LPARAM)_strdup(logBuf));
     }
 
-    // 5. 生成结果
+    // [阶段 3] 生成结果 (无论是否中止，只要有节点就生成)
+    // [性能修复] 替换掉 strcat，使用 memcpy 指针操作，解决节点多时卡死问题
     size_t bufSize = g_node_count * (MAX_URL_LEN + 2) + 1024;
     char* fullText = (char*)malloc(bufSize);
     if (fullText) {
-        fullText[0] = 0;
+        char* ptr = fullText;
+        *ptr = 0;
+
         for (int i = 0; i < g_node_count; i++) {
-            if (g_config.enable_speedtest) {
+            // 过滤逻辑：
+            // 1. 如果测速已开启 且 任务正常完成 -> 过滤掉失败节点 (latency < 0)
+            // 2. 如果任务被中止 -> 全部保留 (用户想保存已有进度)
+            // 3. 如果没开启测速 -> 全部保留
+            if (g_config.enable_speedtest && !IsTaskStopped()) {
                 if (g_nodes[i].latency < 0) continue; 
             }
-            strcat(fullText, g_nodes[i].original_link);
-            strcat(fullText, "\n");
-        }
-        
-        if (strlen(fullText) == 0 && g_node_count > 0) {
-             // 如果测速后全挂了，或者没开测速，至少保留原样
-             for (int i = 0; i < g_node_count; i++) {
-                strcat(fullText, g_nodes[i].original_link);
-                strcat(fullText, "\n");
+            
+            size_t len = strlen(g_nodes[i].original_link);
+            if (len > 0) {
+                memcpy(ptr, g_nodes[i].original_link, len);
+                ptr += len;
+                *ptr++ = '\n'; // 换行符
             }
+        }
+        *ptr = 0; // 结尾
+        
+        // 如果结果为空但有节点 (说明全挂了)，则全部输出备用
+        if ((ptr == fullText) && g_node_count > 0) {
+             ptr = fullText;
+             for (int i = 0; i < g_node_count; i++) {
+                size_t len = strlen(g_nodes[i].original_link);
+                memcpy(ptr, g_nodes[i].original_link, len);
+                ptr += len;
+                *ptr++ = '\n';
+            }
+            *ptr = 0;
         }
         
         char* b64Result = Base64Encode((unsigned char*)fullText, strlen(fullText));
@@ -407,10 +399,7 @@ void StartProcessTask() {
     int maxLen = 1024 * 1024;
     char* buf = (char*)malloc(maxLen);
     extern int GetSubsInputText(char* buffer, int maxLen);
-    if (GetSubsInputText(buf, maxLen) <= 0) {
-        // 如果没有内容，放一个空字符串避免野指针
-        buf[0] = '\0';
-    }
+    if (GetSubsInputText(buf, maxLen) <= 0) buf[0] = 0;
     
     hWorkerThread = (HANDLE)_beginthreadex(NULL, 0, ProcessThreadProc, buf, 0, NULL);
 }
