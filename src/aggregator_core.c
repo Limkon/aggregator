@@ -66,7 +66,7 @@ static int AddNodeSafe(const char* link) {
         ProxyNode* node = &g_nodes[g_node_count];
         memset(node, 0, sizeof(ProxyNode));
         node->id = g_node_count;
-        node->latency = -1.0; // [修复] 默认延迟初始化为 -1，避免被误认为 0ms
+        node->latency = -1.0; 
         strncpy(node->original_link, link, MAX_URL_LEN - 1);
         
         ParseNodeBasic(link, node);
@@ -93,7 +93,7 @@ unsigned int __stdcall SearchThreadProc(void* arg) {
 unsigned int __stdcall WorkerProc(void* p) {
     ThreadArg* arg = (ThreadArg*)p;
     
-    // 在执行前再次检查停止信号
+    // 执行前检查停止信号
     if (WaitForSingleObject(g_hStopEvent, 0) != WAIT_OBJECT_0) {
         arg->cb(arg->item_ptr, arg->thread_idx);
     }
@@ -117,16 +117,13 @@ static void RunConcurrentTasks(void* items, int count, int item_size, TaskCallba
     HANDLE waitHandles[2] = { g_hStopEvent, hSemaphore };
 
     for (int i = 0; i < count; i++) {
-        // 等待：要么有空位(Semaphore)，要么收到停止信号(StopEvent)
         DWORD waitResult = WaitForMultipleObjects(2, waitHandles, FALSE, INFINITE);
         
         if (waitResult == WAIT_OBJECT_0) {
-            // 用户中止
-            PostMessage(g_hMainWnd, WM_APP_LOG, 0, (LPARAM)_strdup(">>> 中止信号已收到，停止分发新任务..."));
+            PostMessage(g_hMainWnd, WM_APP_LOG, 0, (LPARAM)_strdup(">>> 中止信号收到，停止分发..."));
             break; 
         }
         else if (waitResult == WAIT_OBJECT_0 + 1) {
-            // 有空位
             InterlockedIncrement(&active_count);
             
             ThreadArg* arg = (ThreadArg*)malloc(sizeof(ThreadArg));
@@ -152,12 +149,22 @@ static void RunConcurrentTasks(void* items, int count, int item_size, TaskCallba
             if (i % 5 == 0) PostMessage(g_hMainWnd, WM_APP_PROGRESS, i, count);
         }
         else {
-            break; // 错误
+            break; 
         }
     }
     
-    // 等待剩余活动线程结束
-    while (active_count > 0) Sleep(50);
+    // [关键修复] 防止卡死：增加超时等待
+    // 如果子线程卡在 DNS 解析(getaddrinfo)，active_count 不会归零
+    // 我们最多等 3 秒，等不到就强制退出，避免界面无响应
+    DWORD start_tick = GetTickCount();
+    while (active_count > 0) {
+        if (GetTickCount() - start_tick > 3000) { 
+            PostMessage(g_hMainWnd, WM_APP_LOG, 0, (LPARAM)_strdup(">>> 等待子线程超时，强制结束当前流程..."));
+            break; 
+        }
+        Sleep(50);
+    }
+    
     CloseHandle(hSemaphore);
 }
 
@@ -191,7 +198,7 @@ void DownloadSubWorker(void* data, int idx) {
     PostMessage(g_hMainWnd, WM_APP_LOG, 0, (LPARAM)_strdup(logBuf));
     
     const char* proxy = g_config.enable_proxy ? g_config.proxy_url : NULL;
-    char* content = HttpGet(link->url, proxy, 20);
+    char* content = HttpGet(link->url, proxy, g_config.timeout);
     
     if (content) {
         int added = 0;
@@ -288,7 +295,6 @@ unsigned int __stdcall ProcessThreadProc(void* arg) {
     snprintf(logBuf, sizeof(logBuf), "直接节点: %d, 订阅链接: %d", g_node_count, sub_count);
     PostMessage(g_hMainWnd, WM_APP_LOG, 0, (LPARAM)_strdup(logBuf));
     
-    // [阶段 1] 订阅下载 (如果未中止)
     if (sub_count > 0 && !IsTaskStopped()) {
         PostMessage(g_hMainWnd, WM_APP_LOG, 0, (LPARAM)_strdup("--- 开始下载订阅 ---"));
         RunConcurrentTasks(sub_links, sub_count, sizeof(SubLink), DownloadSubWorker, g_config.concurrency);
@@ -303,8 +309,6 @@ unsigned int __stdcall ProcessThreadProc(void* arg) {
         goto cleanup;
     }
 
-    // [阶段 2] 测速 (如果启用 且 未中止)
-    // 关键逻辑变更：如果中止，我们仅仅跳过测速，但继续执行后面的结果生成
     if (g_config.enable_speedtest && !IsTaskStopped()) {
         char modeStr[64];
         snprintf(modeStr, sizeof(modeStr), "--- 开始测速 (%s, 并发 %d) ---", 
@@ -314,13 +318,12 @@ unsigned int __stdcall ProcessThreadProc(void* arg) {
         
         RunConcurrentTasks(g_nodes, g_node_count, sizeof(ProxyNode), SpeedTestWorker, g_config.concurrency);
         
-        // 如果测速期间被中止，跳过排序，直接输出
         if (!IsTaskStopped()) {
             int NodeCompare(const void* a, const void* b) {
                 ProxyNode* na = (ProxyNode*)a;
                 ProxyNode* nb = (ProxyNode*)b;
                 if (na->latency < 0 && nb->latency < 0) return 0;
-                if (na->latency < 0) return 1; // 失败的放后面
+                if (na->latency < 0) return 1;
                 if (nb->latency < 0) return -1;
                 return (na->latency > nb->latency) ? 1 : -1;
             }
@@ -335,8 +338,6 @@ unsigned int __stdcall ProcessThreadProc(void* arg) {
         }
     }
 
-    // [阶段 3] 生成结果 (无论是否中止，只要有节点就生成)
-    // [性能修复] 替换掉 strcat，使用 memcpy 指针操作，解决节点多时卡死问题
     size_t bufSize = g_node_count * (MAX_URL_LEN + 2) + 1024;
     char* fullText = (char*)malloc(bufSize);
     if (fullText) {
@@ -344,24 +345,18 @@ unsigned int __stdcall ProcessThreadProc(void* arg) {
         *ptr = 0;
 
         for (int i = 0; i < g_node_count; i++) {
-            // 过滤逻辑：
-            // 1. 如果测速已开启 且 任务正常完成 -> 过滤掉失败节点 (latency < 0)
-            // 2. 如果任务被中止 -> 全部保留 (用户想保存已有进度)
-            // 3. 如果没开启测速 -> 全部保留
             if (g_config.enable_speedtest && !IsTaskStopped()) {
                 if (g_nodes[i].latency < 0) continue; 
             }
-            
             size_t len = strlen(g_nodes[i].original_link);
             if (len > 0) {
                 memcpy(ptr, g_nodes[i].original_link, len);
                 ptr += len;
-                *ptr++ = '\n'; // 换行符
+                *ptr++ = '\n'; 
             }
         }
-        *ptr = 0; // 结尾
+        *ptr = 0;
         
-        // 如果结果为空但有节点 (说明全挂了)，则全部输出备用
         if ((ptr == fullText) && g_node_count > 0) {
              ptr = fullText;
              for (int i = 0; i < g_node_count; i++) {
