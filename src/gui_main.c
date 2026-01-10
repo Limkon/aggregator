@@ -69,7 +69,6 @@ void CreateAppFont() {
         hFontApp = CreateFontIndirectW(&ncm.lfMessageFont);
     } 
     if (!hFontApp) {
-        // 强制回退到微软雅黑
         hFontApp = CreateFontW(-12, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, 
             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, 
             CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Microsoft YaHei UI");
@@ -83,11 +82,21 @@ BOOL CALLBACK EnumChildProcSetFont(HWND hwnd, LPARAM lParam) {
     return TRUE;
 }
 
-// --- 辅助函数：追加日志 ---
+// --- 辅助函数：追加日志 (优化版) ---
 void GuiAppendLog(const char* message) {
     if (!hEdtLog) return;
+    
+    // [优化] 防止日志堆积导致卡顿
+    // 如果日志超过 30KB，清空一半或全部，保持 Edit 控件轻量
     int len = GetWindowTextLength(hEdtLog);
+    if (len > 30000) {
+        SetWindowTextA(hEdtLog, ""); // 简单粗暴：清空，防止越来越卡
+        len = 0;
+    }
+
     SendMessage(hEdtLog, EM_SETSEL, (WPARAM)len, (LPARAM)len);
+    
+    // 转换编码
     int wlen = MultiByteToWideChar(CP_UTF8, 0, message, -1, NULL, 0);
     if (wlen > 0) {
         wchar_t* wBuf = (wchar_t*)malloc((wlen + 2) * sizeof(wchar_t));
@@ -140,7 +149,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
     case WM_CREATE:
         {
             CreateAppFont();
-            // 使用系统按钮面颜色 (通常是浅灰) 作为统一背景色
             hBrBkg = CreateSolidBrush(GetSysColor(COLOR_BTNFACE)); 
 
             // 1. 搜索
@@ -173,17 +181,15 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             // 4. 测速
             CreateWindowW(L"BUTTON", L"测速配置", WS_CHILD | WS_VISIBLE | BS_GROUPBOX, 10, 350, 810, 120, hWnd, (HMENU)ID_GRP_SPEED, NULL, NULL);
             hChkSpeed = CreateWindowW(L"BUTTON", L"启用测速", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 25, 375, 100, 20, hWnd, (HMENU)ID_CHK_SPEED, NULL, NULL);
-            // [修复] 默认不勾选测速，防止无配置时误操作
             SendMessage(hChkSpeed, BM_SETCHECK, BST_UNCHECKED, 0);
 
             hRadSingbox = CreateWindowW(L"BUTTON", L"Sing-box (真实延迟)", WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON | WS_GROUP, 130, 375, 140, 20, hWnd, (HMENU)ID_RAD_SINGBOX, NULL, NULL);
             hRadTcp = CreateWindowW(L"BUTTON", L"TCP Ping (握手延迟)", WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON, 280, 375, 140, 20, hWnd, (HMENU)ID_RAD_TCP, NULL, NULL);
             SendMessage(hRadSingbox, BM_SETCHECK, BST_CHECKED, 0);
 
-            // [修改] 标签改为 (ms)，默认值改为 3000
             CreateWindowW(L"STATIC", L"超时(ms):", WS_CHILD | WS_VISIBLE, 25, 405, 60, 20, hWnd, (HMENU)ID_LBL_TIMEOUT, NULL, NULL);
             hEdtTimeout = CreateWindowW(L"EDIT", L"3000", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_NUMBER, 90, 402, 50, 23, hWnd, (HMENU)ID_EDT_TIMEOUT, NULL, NULL);
-
+            
             CreateWindowW(L"STATIC", L"并发数:", WS_CHILD | WS_VISIBLE, 160, 405, 50, 20, hWnd, (HMENU)ID_LBL_CONCUR, NULL, NULL);
             hEdtConcur = CreateWindowW(L"EDIT", L"10", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_NUMBER, 210, 402, 40, 23, hWnd, (HMENU)ID_EDT_CONCUR, NULL, NULL);
             
@@ -193,7 +199,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             // 5. 执行
             hBtnRun = CreateWindowW(L"BUTTON", L"执行聚合处理 (含测速)", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 25, 435, 765, 30, hWnd, (HMENU)ID_BTN_RUN, NULL, NULL);
 
-            // 6. 日志 (ES_READONLY 会触发 WM_CTLCOLORSTATIC)
+            // 6. 日志
             CreateWindowW(L"BUTTON", L"处理日志", WS_CHILD | WS_VISIBLE | BS_GROUPBOX, 10, 480, 810, 200, hWnd, (HMENU)ID_GRP_LOG, NULL, NULL);
             hEdtLog = CreateWindowW(L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY, 20, 505, 790, 165, hWnd, (HMENU)ID_EDT_LOG, NULL, NULL);
 
@@ -259,8 +265,18 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
     case WM_APP_PREVIEW:
         {
              char* result = (char*)lParam;
-             SetWindowTextA(hEdtResult, result);
-             if (result) free(result);
+             if (result) {
+                 // [优化] 防止大文本卡死
+                 if (strlen(result) > 65535) {
+                     char temp[66000];
+                     memcpy(temp, result, 65000);
+                     strcpy(temp + 65000, "\r\n... (内容过长，请使用保存文件功能查看完整结果) ...");
+                     SetWindowTextA(hEdtResult, temp);
+                 } else {
+                     SetWindowTextA(hEdtResult, result);
+                 }
+                 free(result);
+             }
         }
         break;
 
@@ -270,19 +286,13 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
         PostQuitMessage(0);
         break;
 
-    // [修复] 解决重影核心代码
-    // Static 控件和 ReadOnly Edit 控件都会触发 WM_CTLCOLORSTATIC
     case WM_CTLCOLORSTATIC:
-    case WM_CTLCOLOREDIT: // 部分情况下 Edit 也可能触发这个，保险起见加上
+    case WM_CTLCOLOREDIT: 
         {
             HDC hdc = (HDC)wParam;
-            // 1. 设置文字背景色与窗口背景一致 (COLOR_BTNFACE)
             SetBkColor(hdc, GetSysColor(COLOR_BTNFACE));
-            // 2. 设置文字颜色为系统文本色
             SetTextColor(hdc, GetSysColor(COLOR_WINDOWTEXT));
-            // 3. 关键：设置为 OPAQUE (不透明)，这会用 BkColor 填充矩形，从而擦除旧文字
             SetBkMode(hdc, OPAQUE);
-            // 4. 返回背景画刷 (与窗口背景一致)
             return (LRESULT)hBrBkg;
         }
         break;
@@ -301,7 +311,7 @@ bool CreateMainWindow(HINSTANCE hInstance, int nShow) {
     wcex.lpfnWndProc = WndProc;
     wcex.hInstance = hInstance;
     wcex.hCursor = LoadCursor(NULL, IDC_ARROW);
-    wcex.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1); // 默认背景色
+    wcex.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
     wcex.lpszClassName = L"ProxyAggregatorClass";
     wcex.hIcon = LoadIcon(hInstance, MAKEINTRESOURCE(101)); 
 
