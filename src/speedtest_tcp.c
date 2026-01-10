@@ -13,97 +13,92 @@ static double GetTimeMs() {
     return (double)counter.QuadPart * 1000.0 / (double)freq.QuadPart;
 }
 
+// 简单的日志辅助 (需要 aggregator_core.c 暴露或自己实现，这里为了解耦暂不使用)
+// 只要返回 -1.0，上层自然会过滤掉
+
 /**
  * 执行 TCP Ping 测速
- * @param address       目标地址 (IP 或域名)
- * @param port          目标端口
- * @param timeout_ms    超时时间 (毫秒) [修改]
- * @return              延迟毫秒数，失败或超时返回 -1.0
  */
 double SpeedTest_TcpPing(const char* address, int port, int timeout_ms) {
-    if (!address || port <= 0 || port > 65535) return -1.0;
+    if (!address || port <= 0 || port > 65535 || strlen(address) == 0) return -1.0;
 
     struct addrinfo hints = {0};
     struct addrinfo* res = NULL;
     SOCKET sock = INVALID_SOCKET;
     double start_time, end_time, latency = -1.0;
-    int result;
 
-    // 1. DNS 解析 (可能会阻塞，但在工作线程中执行无妨)
-    hints.ai_family = AF_UNSPEC; // IPv4 or IPv6
+    hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_protocol = IPPROTO_TCP;
 
     char port_str[16];
     snprintf(port_str, sizeof(port_str), "%d", port);
 
+    // [注意] getaddrinfo 可能会阻塞。如果 address 是被墙的域名，这里可能卡很久
     if (getaddrinfo(address, port_str, &hints, &res) != 0) {
-        return -1.0; // 解析失败
+        return -1.0; 
     }
 
-    // 2. 遍历解析结果尝试连接
     struct addrinfo* ptr = NULL;
     for (ptr = res; ptr != NULL; ptr = ptr->ai_next) {
         sock = socket(ptr->ai_family, ptr->ai_socktype, ptr->ai_protocol);
         if (sock == INVALID_SOCKET) continue;
 
-        // 设置非阻塞模式
         unsigned long on = 1;
-        if (ioctlsocket(sock, FIONBIO, &on) != 0) {
+        ioctlsocket(sock, FIONBIO, &on);
+
+        start_time = GetTimeMs();
+
+        if (connect(sock, ptr->ai_addr, (int)ptr->ai_addrlen) == 0) {
+            // 立即连接成功 (极少见)
+            end_time = GetTimeMs();
+            latency = end_time - start_time;
+            closesocket(sock);
+            break; 
+        }
+
+        if (WSAGetLastError() != WSAEWOULDBLOCK) {
             closesocket(sock);
             sock = INVALID_SOCKET;
             continue;
         }
 
-        // 开始计时
-        start_time = GetTimeMs();
-
-        // 发起连接
-        result = connect(sock, ptr->ai_addr, (int)ptr->ai_addrlen);
-
-        if (result == SOCKET_ERROR) {
-            if (WSAGetLastError() != WSAEWOULDBLOCK) {
-                // 真正的错误
-                closesocket(sock);
-                sock = INVALID_SOCKET;
-                continue;
-            }
-        }
-
-        // 使用 select 等待连接完成 (实现超时控制)
-        fd_set write_fds;
+        fd_set write_fds, except_fds;
         FD_ZERO(&write_fds);
+        FD_ZERO(&except_fds);
         FD_SET(sock, &write_fds);
+        FD_SET(sock, &except_fds); // [修复] 监听异常集合
 
         struct timeval tv;
-        // [修改] 将毫秒转换为 秒 + 微秒
         tv.tv_sec = timeout_ms / 1000;
         tv.tv_usec = (timeout_ms % 1000) * 1000;
 
-        // select 返回 > 0 表示有事件，socket 可写即表示连接成功
-        int sel_res = select(0, NULL, &write_fds, NULL, &tv);
+        int sel_res = select(0, NULL, &write_fds, &except_fds, &tv);
         
         if (sel_res > 0) {
-            // 还需要检查 SO_ERROR 确认是否真的成功
-            int error = 0;
-            int len = sizeof(error);
-            if (getsockopt(sock, SOL_SOCKET, SO_ERROR, (char*)&error, &len) == 0) {
-                if (error == 0) {
-                    // 连接成功！
-                    end_time = GetTimeMs();
-                    latency = end_time - start_time;
-                    closesocket(sock);
-                    break; // 跳出循环，返回结果
+            // 检查是否有异常 (连接被拒绝/RST)
+            if (FD_ISSET(sock, &except_fds)) {
+                // 连接失败
+            }
+            else if (FD_ISSET(sock, &write_fds)) {
+                // 可写，进一步检查 SO_ERROR
+                int error = 0;
+                int len = sizeof(error);
+                if (getsockopt(sock, SOL_SOCKET, SO_ERROR, (char*)&error, &len) == 0) {
+                    if (error == 0) {
+                        end_time = GetTimeMs();
+                        latency = end_time - start_time;
+                        closesocket(sock);
+                        break; // 成功！
+                    }
                 }
             }
         }
 
-        // 失败或超时
         closesocket(sock);
         sock = INVALID_SOCKET;
     }
 
     if (res) freeaddrinfo(res);
-
     return latency;
 }
