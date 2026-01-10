@@ -173,7 +173,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             // 4. 测速
             CreateWindowW(L"BUTTON", L"测速配置", WS_CHILD | WS_VISIBLE | BS_GROUPBOX, 10, 350, 810, 120, hWnd, (HMENU)ID_GRP_SPEED, NULL, NULL);
             hChkSpeed = CreateWindowW(L"BUTTON", L"启用测速", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 25, 375, 100, 20, hWnd, (HMENU)ID_CHK_SPEED, NULL, NULL);
-            SendMessage(hChkSpeed, BM_SETCHECK, BST_CHECKED, 0);
+            // [修复] 默认不勾选测速，防止无配置时误操作
+            SendMessage(hChkSpeed, BM_SETCHECK, BST_UNCHECKED, 0);
 
             hRadSingbox = CreateWindowW(L"BUTTON", L"Sing-box (真实延迟)", WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON | WS_GROUP, 130, 375, 140, 20, hWnd, (HMENU)ID_RAD_SINGBOX, NULL, NULL);
             hRadTcp = CreateWindowW(L"BUTTON", L"TCP Ping (握手延迟)", WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON, 280, 375, 140, 20, hWnd, (HMENU)ID_RAD_TCP, NULL, NULL);
