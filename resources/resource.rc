@@ -2,10 +2,14 @@
 
 // 1. 应用程序图标
 // ID 101 对应 src/gui_main.c 中的 MAKEINTRESOURCE(101)
-// 请确保 resources 目录下有名为 app.ico 的图标文件
 101 ICON "app.ico"
 
-// 2. 版本信息结构
+// [新增] 2. SSL根证书 (嵌入到 EXE 中)
+// ID 2 对应 src/utils_net.c 中的 MAKEINTRESOURCE(2)
+// 类型 RCDATA (Raw Data)
+2 RCDATA "cacert.pem"
+
+// 3. 版本信息结构
 VS_VERSION_INFO VERSIONINFO
 FILEVERSION 1,0,0,0
 PRODUCTVERSION 1,0,0,0
@@ -40,8 +44,7 @@ BEGIN
     END
 END
 
-// 3. Manifest (用于启用 Windows 现代控件风格，如圆角按钮、进度条等)
-// ID 1, Type 24 (RT_MANIFEST)
+// 4. Manifest (启用 Windows 现代控件风格)
 1 24
 BEGIN
     "<?xml version=""1.0"" encoding=""UTF-8"" standalone=""yes""?>\r\n"
