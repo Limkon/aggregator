@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <windows.h>
 #include <process.h>
+#include <io.h> // [新增] 用于 _access 检查文件存在性
 
 // 外部声明：从 parser_nodes.c 获取 Sing-box 出站配置生成器
 extern cJSON* GenerateSingboxOutbound(const char* link);
@@ -31,7 +32,8 @@ static char* CreateSingboxConfig(cJSON* outbound, int local_port) {
     // Inbounds: SOCKS 入站
     cJSON* inbounds = cJSON_CreateArray();
     cJSON* in_item = cJSON_CreateObject();
-    cJSON_AddStringToObject(in_item, "type", "socks");
+    // [修正] 改为 mixed 以支持 HTTP 代理请求，否则 OpenSSL HttpGet 可能无法连接
+    cJSON_AddStringToObject(in_item, "type", "mixed");
     cJSON_AddStringToObject(in_item, "tag", "socks-in");
     cJSON_AddStringToObject(in_item, "listen", "127.0.0.1");
     cJSON_AddNumberToObject(in_item, "listen_port", local_port);
@@ -83,16 +85,18 @@ static char* CreateSingboxConfig(cJSON* outbound, int local_port) {
 double SpeedTest_Singbox(const char* node_link, int port_index, int timeout_sec, const char* test_url) {
     if (!node_link || !test_url) return -1.0;
 
+    // [修复] 预先检查 sing-box.exe 是否存在
+    // 如果文件不存在，CreateProcess 并发调用会导致严重性能问题甚至卡死
+    if (_access(SINGBOX_EXE_NAME, 0) != 0) {
+        return -1.0;
+    }
+
     // 1. 生成配置
     cJSON* outbound = GenerateSingboxOutbound(node_link);
     if (!outbound) return -1.0; // 解析失败或不支持的协议
 
     int local_port = SINGBOX_BASE_PORT + port_index;
-    char* config_json = CreateSingboxConfig(outbound, local_port); // outbound ownership transferred inside? No, cJSON_AddItem transfers.
-    // 注意：GenerateSingboxOutbound 返回的指针被 add 到 root 后，root delete 时会一起释放。
-    // 所以 CreateSingboxConfig 内部逻辑必须正确处理所有权。
-    // 上面的 CreateSingboxConfig 实现中：cJSON_AddItemToArray(outbounds, outbound) 转移了所有权。
-    // 因此这里不需要 cJSON_Delete(outbound)。
+    char* config_json = CreateSingboxConfig(outbound, local_port); 
     
     if (!config_json) return -1.0;
 
@@ -123,7 +127,7 @@ double SpeedTest_Singbox(const char* node_link, int port_index, int timeout_sec,
     snprintf(cmd_line, sizeof(cmd_line), "\"%s\" run -c \"%s\"", SINGBOX_EXE_NAME, config_filename);
 
     if (!CreateProcessA(NULL, cmd_line, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
-        // 启动失败 (找不到 exe?)
+        // 启动失败
         DeleteFileA(config_filename);
         return -1.0;
     }
@@ -143,24 +147,9 @@ double SpeedTest_Singbox(const char* node_link, int port_index, int timeout_sec,
 
     // 5. 通过代理发起请求 (复用 utils_net.c 的 HttpGet)
     char proxy_url[64];
-    snprintf(proxy_url, sizeof(proxy_url), "127.0.0.1:%d", local_port); // WinINet/OpenSSL 代理格式
+    snprintf(proxy_url, sizeof(proxy_url), "127.0.0.1:%d", local_port); 
 
     double start_time = GetTimeMs();
-    
-    // 调用 HttpGet (utils_net.c 中的实现需支持 SOCKS 或 HTTP 代理)
-    // 警告：之前的 utils_net.c (OpenSSL版) 尚未实现 SOCKS 握手逻辑，仅支持 HTTP 代理。
-    // Sing-box 默认提供 mixed (HTTP/SOCKS) 还是纯 SOCKS？
-    // 上面配置的是 "type": "socks"。OpenSSL 不支持直接连接 SOCKS。
-    // 修正：将 Sing-box 入站改为 "mixed" 或 "http" 以便 HttpGet 可以连接。
-    // 这里我们修改上面的 CreateSingboxConfig 里的 inbound type 为 "mixed" (支持 HTTP 和 SOCKS)。
-    
-    // (修正 CreateSingboxConfig 中的 "socks" -> "mixed")
-    // 但 cJSON 对象已生成，无法此处修改。
-    // *关键修正*：请确保 utils_net.c 能够处理 HTTP 代理，或者我们让 Sing-box 开启 mixed 端口。
-    // Sing-box 的 "mixed" 类型同时支持 HTTP 和 SOCKS5。
-    // 为了兼容性，建议 CreateSingboxConfig 中使用 "mixed"。
-    
-    // ... 假设 inbound 已改为 mixed ...
     
     char* response = HttpGet(test_url, proxy_url, timeout_sec);
     double latency = -1.0;
@@ -183,10 +172,3 @@ double SpeedTest_Singbox(const char* node_link, int port_index, int timeout_sec,
 
     return latency;
 }
-
-// [修正补丁] 为了支持 utils_net.c (OpenSSL) 的 HTTP 代理能力
-// 我们需要覆盖上面的 CreateSingboxConfig 中的 inbound type
-// 请在整合代码时，将 CreateSingboxConfig 函数中的:
-// cJSON_AddStringToObject(in_item, "type", "socks");
-// 修改为:
-// cJSON_AddStringToObject(in_item, "type", "mixed");
