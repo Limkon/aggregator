@@ -10,6 +10,8 @@
 extern void GuiAppendLog(const char* message);
 extern void SetSubsInputText(const char* text);
 extern int GetSubsInputText(char* buffer, int maxLen);
+// [新增] 声明 utils_net.c 中新增的带代理请求函数 (无需修改头文件即可使用)
+extern char* NetRequestWithProxy(const char* url, const char* token, const char* proxy);
 
 // --- 辅助：从文本提取节点 ---
 // 返回提取到的数量
@@ -58,6 +60,12 @@ void SearchGitHubKeywords(const char* token, const char* query, int pages, HWND 
     if (!query || strlen(query) == 0) {
         PostMessage(hNotify, WM_APP_LOG, 0, (LPARAM)strdup("错误: 未指定搜索关键字"));
         return;
+    }
+
+    // [新增] 获取代理配置
+    const char* proxy_url = NULL;
+    if (g_config.enable_proxy && g_config.proxy_url[0] != '\0') {
+        proxy_url = g_config.proxy_url;
     }
 
     // [修复] 不要直接修改 query，使用副本
@@ -116,9 +124,10 @@ void SearchGitHubKeywords(const char* token, const char* query, int pages, HWND 
                 snprintf(logBuf, sizeof(logBuf), "搜索: %s (Ext: %s, 页 %d)", keywords[k], extensions[e], page);
                 PostMessage(hNotify, WM_APP_LOG, 0, (LPARAM)strdup(logBuf));
 
-                // 发起 HTTP 请求
+                // 发起 HTTP 请求 (使用代理)
                 const char* api_token = (token && token[0]) ? token : NULL;
-                char* response = NetRequest(url, api_token);
+                // [Fix] 使用 NetRequestWithProxy 代替 NetRequest
+                char* response = NetRequestWithProxy(url, api_token, proxy_url);
                 
                 if (!response) {
                     // 如果没有 Token，GitHub 很容易 403，不要立即放弃，可能只是限流
@@ -171,7 +180,9 @@ void SearchGitHubKeywords(const char* token, const char* query, int pages, HWND 
                                 }
 
                                 Sleep(300); // 避免请求 raw 内容过快
-                                char* file_content = NetRequest(raw_url, NULL);
+                                
+                                // [Fix] 下载内容也必须走代理 (raw.githubusercontent.com 经常被墙)
+                                char* file_content = NetRequestWithProxy(raw_url, NULL, proxy_url);
                                 
                                 if (file_content) {
                                     // 1. 尝试直接提取
@@ -209,12 +220,19 @@ void SearchGitHubKeywords(const char* token, const char* query, int pages, HWND 
         }
     }
 
-    // 4. 更新 UI
+    // 4. 更新 UI (正常完成)
     SetSubsInputText(result_buffer);
     PostMessage(hNotify, WM_APP_LOG, 0, (LPARAM)strdup("搜索任务完成，结果已填入订阅框"));
 
 cleanup:
+    // [Fix] 核心修复：如果被中止，确保缓冲区里的内容不会丢失，写回 UI
+    if (result_buffer) {
+        // 如果是中途退出的，result_buffer 里存着目前为止找到的节点
+        // 这里再次调用 SetSubsInputText 确保它们被保存
+        SetSubsInputText(result_buffer);
+        free(result_buffer);
+    }
+    
     if (kw_copy) free(kw_copy);
-    if (result_buffer) free(result_buffer);
     // 注意：不要发送 WM_APP_TASK_DONE，因为调用者 aggregator_core.c 会发送
 }
