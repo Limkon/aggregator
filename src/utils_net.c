@@ -1,7 +1,7 @@
 /* src/utils_net.c */
 #include "common.h"
 #include "utils_net.h"
-#include "gui.h" // 引入 GUI 定义以便发送日志消息
+#include "gui.h" 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -13,35 +13,90 @@
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <openssl/x509.h>
+#include <openssl/pem.h> // [新增] 用于解析内存中的 PEM 证书
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "crypt32.lib")
 
-// --- 外部变量 (直接引用主窗口句柄发送日志) ---
+// --- 外部变量 ---
 extern HWND g_hMainWnd;
 
-// --- 内部日志辅助函数 ---
+// --- 日志辅助 ---
 static void NetLog(const char* fmt, ...) {
     if (!g_hMainWnd) return;
-    
     char buf[1024];
     va_list args;
     va_start(args, fmt);
     vsnprintf(buf, sizeof(buf), fmt, args);
     va_end(args);
-
-    // 发送日志消息 (WM_APP_LOG 需要接收端负责释放内存，使用 _strdup)
-    // 注意：高频日志可能会刷屏，生产环境可通过宏控制开关
     PostMessage(g_hMainWnd, WM_APP_LOG, 0, (LPARAM)_strdup(buf));
 }
 
-// --- 全局状态变量 ---
+// --- 全局变量 ---
 static SSL_CTX* g_ssl_ctx = NULL;
 static volatile LONG s_ctxInitState = 0; 
 static volatile LONG s_active_requests = 0;
 static volatile BOOL s_is_cleaning_up = FALSE;
 
-// --- URL 解析结构 ---
+// --- [核心功能] 从 EXE 资源段加载证书 ---
+static BOOL LoadCacertFromResource(SSL_CTX* ctx) {
+    // 资源 ID 2 对应 resource.rc 中的: 2 RCDATA "cacert.pem"
+    // RT_RCDATA 是 Windows 标准资源类型
+    HRSRC hRes = FindResource(NULL, MAKEINTRESOURCE(2), RT_RCDATA);
+    if (!hRes) {
+        NetLog("[Net] 错误: 未能在 EXE 资源中找到证书 (ID=2)");
+        return FALSE;
+    }
+
+    HGLOBAL hData = LoadResource(NULL, hRes);
+    if (!hData) return FALSE;
+
+    void* pData = LockResource(hData);
+    DWORD size = SizeofResource(NULL, hRes);
+    
+    if (!pData || size == 0) return FALSE;
+
+    NetLog("[Net] 从 EXE 资源加载证书 (%d bytes)...", size);
+
+    // 创建内存 BIO
+    BIO* cbio = BIO_new_mem_buf(pData, size);
+    if (!cbio) {
+        NetLog("[Net] BIO 创建失败");
+        return FALSE;
+    }
+
+    // 获取 SSL 上下文的证书存储区
+    X509_STORE* store = SSL_CTX_get_cert_store(ctx);
+    if (!store) {
+        BIO_free(cbio);
+        return FALSE;
+    }
+
+    X509* cert = NULL;
+    int count = 0;
+    
+    // 循环读取所有证书并添加到存储区
+    while ((cert = PEM_read_bio_X509(cbio, NULL, 0, NULL)) != NULL) {
+        if (X509_STORE_add_cert(store, cert)) {
+            count++;
+        }
+        X509_free(cert);
+    }
+    
+    // 获取错误队列中的最后错误，判断是 EOF 还是解析错误
+    unsigned long err = ERR_peek_last_error();
+    if (ERR_GET_LIB(err) == ERR_LIB_PEM && ERR_GET_REASON(err) == PEM_R_NO_START_LINE) {
+        // 正常的 EOF，清除错误
+        ERR_clear_error();
+    }
+
+    BIO_free(cbio);
+    
+    NetLog("[Net] 成功导入 %d 个根证书", count);
+    return (count > 0);
+}
+
+// --- URL 解析 ---
 typedef struct {
     char scheme[16];
     char host[256];
@@ -93,6 +148,7 @@ static BOOL ParseUrl(const char* url, URL_COMPONENTS_SIMPLE* out) {
     return TRUE;
 }
 
+// --- 初始化 SSL (更新版) ---
 static BOOL InitSSLContext() {
     if (g_ssl_ctx != NULL) return TRUE;
 
@@ -102,20 +158,36 @@ static BOOL InitSSLContext() {
             return FALSE;
         }
 
-        NetLog("[Net] 初始化 SSL 上下文...");
+        NetLog("[Net] 初始化 SSL 上下文 (单文件模式)...");
         const SSL_METHOD* method = TLS_client_method();
         SSL_CTX* ctx = SSL_CTX_new(method);
 
         if (ctx) {
-            if (SSL_CTX_load_verify_locations(ctx, "cacert.pem", NULL) != 1) {
-                if (SSL_CTX_load_verify_locations(ctx, "resources/cacert.pem", NULL) != 1) {
-                    NetLog("[Net] 警告: 未找到 cacert.pem，跳过证书验证");
-                    SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
-                } else {
-                    SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
+            BOOL certLoaded = FALSE;
+
+            // 策略 1: 优先尝试加载外部文件 (方便开发调试)
+            if (SSL_CTX_load_verify_locations(ctx, "cacert.pem", NULL) == 1) {
+                NetLog("[Net] 加载外部 cacert.pem 成功");
+                certLoaded = TRUE;
+            } 
+            else if (SSL_CTX_load_verify_locations(ctx, "resources/cacert.pem", NULL) == 1) {
+                NetLog("[Net] 加载外部 resources/cacert.pem 成功");
+                certLoaded = TRUE;
+            }
+
+            // 策略 2: 如果外部文件不存在，尝试从 EXE 资源加载 (单文件发布)
+            if (!certLoaded) {
+                if (LoadCacertFromResource(ctx)) {
+                    certLoaded = TRUE;
                 }
-            } else {
+            }
+
+            // 最终配置
+            if (certLoaded) {
                 SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
+            } else {
+                NetLog("[Net] 警告: 无法加载任何证书，禁用 SSL 验证 (不安全)");
+                SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
             }
 
             EnterCriticalSection(&g_dataLock);
@@ -143,7 +215,7 @@ static BOOL InitSSLContext() {
     }
 }
 
-// [Debug] 连接并打印详细步骤
+// --- 连接代理逻辑 ---
 static SOCKET ConnectWithProxy(const char* host, int port, const char* proxy_url, int timeout_ms) {
     SOCKET s = INVALID_SOCKET;
     struct addrinfo hints = { 0 };
@@ -159,24 +231,21 @@ static SOCKET ConnectWithProxy(const char* host, int port, const char* proxy_url
     if (useProxy) {
         strncpy(targetHost, proxyInfo.host, sizeof(targetHost)-1);
         targetPort = proxyInfo.port;
-        NetLog("[Net] 准备连接代理: %s:%d (目标: %s:%d)", targetHost, targetPort, host, port);
+        NetLog("[Net] 连接代理: %s:%d -> %s", targetHost, targetPort, host);
     } else {
         strncpy(targetHost, host, sizeof(targetHost)-1);
         targetPort = port;
-        // NetLog("[Net] 准备直连: %s:%d", targetHost, targetPort); // 减少刷屏
     }
 
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
     snprintf(portStr, sizeof(portStr), "%d", targetPort);
 
-    // 1. DNS 解析
     if (getaddrinfo(targetHost, portStr, &hints, &res) != 0) {
         NetLog("[Net] DNS 解析失败: %s", targetHost);
         return INVALID_SOCKET;
     }
 
-    // 2. 建立 TCP 连接
     struct addrinfo* ptr = NULL;
     for (ptr = res; ptr != NULL; ptr = ptr->ai_next) {
         if (s_is_cleaning_up) break;
@@ -187,13 +256,7 @@ static SOCKET ConnectWithProxy(const char* host, int port, const char* proxy_url
         setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&conn_timeout, sizeof(conn_timeout));
         setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&conn_timeout, sizeof(conn_timeout));
 
-        if (connect(s, ptr->ai_addr, (int)ptr->ai_addrlen) == 0) {
-            // NetLog("[Net] TCP 连接成功");
-            break;
-        }
-        
-        int err = WSAGetLastError();
-        NetLog("[Net] TCP 连接尝试失败 (Err: %d)", err);
+        if (connect(s, ptr->ai_addr, (int)ptr->ai_addrlen) == 0) break;
         
         closesocket(s);
         s = INVALID_SOCKET;
@@ -201,11 +264,10 @@ static SOCKET ConnectWithProxy(const char* host, int port, const char* proxy_url
     freeaddrinfo(res);
 
     if (s == INVALID_SOCKET) {
-        NetLog("[Net] 无法建立 TCP 连接");
+        NetLog("[Net] TCP 连接失败");
         return INVALID_SOCKET;
     }
 
-    // 3. 代理 HTTP 隧道握手 (CONNECT)
     if (useProxy) {
         char connectReq[512];
         snprintf(connectReq, sizeof(connectReq), 
@@ -214,9 +276,8 @@ static SOCKET ConnectWithProxy(const char* host, int port, const char* proxy_url
             "Proxy-Connection: Keep-Alive\r\n\r\n",
             host, port, host, port);
         
-        NetLog("[Net] 发送代理 CONNECT 指令...");
         if (send(s, connectReq, (int)strlen(connectReq), 0) <= 0) {
-            NetLog("[Net] 代理请求发送失败");
+            NetLog("[Net] 代理握手发送失败");
             closesocket(s);
             return INVALID_SOCKET;
         }
@@ -224,19 +285,17 @@ static SOCKET ConnectWithProxy(const char* host, int port, const char* proxy_url
         char respBuf[1024];
         int n = recv(s, respBuf, sizeof(respBuf)-1, 0);
         if (n <= 0) {
-            NetLog("[Net] 代理服务器无响应或断开");
+            NetLog("[Net] 代理无响应");
             closesocket(s);
             return INVALID_SOCKET;
         }
         respBuf[n] = 0;
         
-        // 解析第一行响应
-        char* firstLineEnd = strstr(respBuf, "\r\n");
-        if (firstLineEnd) *firstLineEnd = 0;
-        NetLog("[Net] 代理响应: %s", respBuf);
-
-        if (!strstr(respBuf, " 200 ")) { 
-            NetLog("[Net] 代理拒绝连接 (非 200 OK)");
+        if (!strstr(respBuf, " 200 ")) {
+            // 简单解析首行错误
+            char* crlf = strstr(respBuf, "\r\n");
+            if(crlf) *crlf = 0;
+            NetLog("[Net] 代理拒绝: %s", respBuf);
             closesocket(s);
             return INVALID_SOCKET;
         }
@@ -245,6 +304,7 @@ static SOCKET ConnectWithProxy(const char* host, int port, const char* proxy_url
     return s;
 }
 
+// --- 请求逻辑 ---
 static char* InternalRequest(const char* url, int timeout_ms, const char* auth_token, const char* proxy, char* out_location, int loc_size) {
     if (s_is_cleaning_up) return NULL;
     InterlockedIncrement(&s_active_requests);
@@ -256,40 +316,31 @@ static char* InternalRequest(const char* url, int timeout_ms, const char* auth_t
 
     URL_COMPONENTS_SIMPLE u;
     if (!ParseUrl(url, &u)) {
-        NetLog("[Net] URL 解析失败: %s", url);
+        NetLog("[Net] URL 格式错误");
         goto cleanup;
     }
 
     BOOL is_https = (strcmp(u.scheme, "https") == 0);
     if (is_https && !InitSSLContext()) goto cleanup;
 
-    // 步骤 1: TCP/Proxy 连接
     s = ConnectWithProxy(u.host, u.port, proxy, timeout_ms);
     if (s == INVALID_SOCKET) goto cleanup;
 
     if (s_is_cleaning_up) goto cleanup;
 
-    // 步骤 2: SSL 握手
     if (is_https) {
-        NetLog("[Net] 开始 SSL 握手: %s", u.host);
+        // NetLog("[Net] SSL 握手..."); // 减少日志
         ssl = SSL_new(g_ssl_ctx);
-        if (!ssl) {
-            NetLog("[Net] SSL_new 失败");
-            goto cleanup;
-        }
+        if (!ssl) goto cleanup;
         SSL_set_fd(ssl, (int)s);
         SSL_set_tlsext_host_name(ssl, u.host);
         
-        int ret = SSL_connect(ssl);
-        if (ret != 1) {
-            int err = SSL_get_error(ssl, ret);
-            NetLog("[Net] SSL 握手失败 (Ret: %d, Err: %d)", ret, err);
+        if (SSL_connect(ssl) != 1) {
+            NetLog("[Net] SSL 握手失败: %s", u.host);
             goto cleanup;
         }
-        // NetLog("[Net] SSL 握手成功");
     }
 
-    // 步骤 3: 发送 HTTP 请求
     char extra_headers[512] = {0};
     if (auth_token && strlen(auth_token) > 0) {
         snprintf(extra_headers, sizeof(extra_headers), "Authorization: Bearer %s\r\n", auth_token);
@@ -306,15 +357,9 @@ static char* InternalRequest(const char* url, int timeout_ms, const char* auth_t
         u.path, u.host, extra_headers);
 
     int req_len = (int)strlen(req);
-    // NetLog("[Net] 发送 GET 请求 (%d bytes)...", req_len);
-    
     int written = is_https ? SSL_write(ssl, req, req_len) : send(s, req, req_len, 0);
-    if (written <= 0) {
-        NetLog("[Net] 发送请求失败");
-        goto cleanup;
-    }
+    if (written <= 0) goto cleanup;
 
-    // 步骤 4: 读取响应
     unsigned long on = 1;
     ioctlsocket(s, FIONBIO, &on);
 
@@ -324,21 +369,17 @@ static char* InternalRequest(const char* url, int timeout_ms, const char* auth_t
     if (!buf) goto cleanup;
 
     ULONGLONG tick_start = GetTickCount64();
-    BOOL first_chunk = TRUE;
 
     while (buf && !s_is_cleaning_up) {
         ULONGLONG now = GetTickCount64();
         if (now - tick_start > (ULONGLONG)timeout_ms) {
-            NetLog("[Net] 读取超时 (%s)", u.host);
+            NetLog("[Net] 下载超时: %s", u.host);
             break;
         }
 
         if (total_len >= total_cap - 1024) {
             size_t new_cap = total_cap * 2;
-            if (new_cap > 8 * 1024 * 1024) {
-                NetLog("[Net] 响应过大，停止下载");
-                break; 
-            }
+            if (new_cap > 8 * 1024 * 1024) break; 
             char* new_buf = (char*)realloc(buf, new_cap);
             if (!new_buf) break;
             buf = new_buf;
@@ -353,10 +394,6 @@ static char* InternalRequest(const char* url, int timeout_ms, const char* auth_t
         }
 
         if (n > 0) {
-            if (first_chunk) {
-                // NetLog("[Net] 收到首包数据: %d bytes", n);
-                first_chunk = FALSE;
-            }
             total_len += n;
         } else {
             int should_retry = 0;
@@ -370,30 +407,27 @@ static char* InternalRequest(const char* url, int timeout_ms, const char* auth_t
             if (should_retry) {
                 long long remaining = (long long)timeout_ms - (long long)(GetTickCount64() - tick_start);
                 if (remaining <= 0) break;
-
+                
                 fd_set r_fds;
                 FD_ZERO(&r_fds);
                 FD_SET(s, &r_fds);
                 struct timeval tv;
                 tv.tv_sec = (long)(remaining / 1000);
                 tv.tv_usec = (long)((remaining % 1000) * 1000);
-                if (tv.tv_sec > 0 || tv.tv_usec > 100000) { tv.tv_sec = 0; tv.tv_usec = 100000; }
-                
+                if (tv.tv_sec > 0 || tv.tv_usec > 50000) { tv.tv_sec = 0; tv.tv_usec = 50000; }
                 select(0, &r_fds, NULL, NULL, &tv);
                 continue;
             }
-            if (n == 0) break; // EOF
-            break; // Error
+            if (n == 0) break; 
+            break; 
         }
     }
 
-    // 步骤 5: 处理结果
     if (buf && total_len > 0 && !s_is_cleaning_up) {
         buf[total_len] = 0;
         int status_code = 0;
         if (sscanf(buf, "HTTP/%*d.%*d %d", &status_code) == 1) {
             if (status_code >= 300 && status_code < 400 && out_location) {
-                // NetLog("[Net] 重定向: %d", status_code);
                 char* loc = strstr(buf, "\nLocation:");
                 if (!loc) loc = strstr(buf, "\nlocation:");
                 if (loc) {
@@ -410,7 +444,6 @@ static char* InternalRequest(const char* url, int timeout_ms, const char* auth_t
                 }
             }
             else if (status_code == 200) {
-                // NetLog("[Net] HTTP 200 OK, 下载完成");
                 char* body_start = strstr(buf, "\r\n\r\n");
                 if (body_start) {
                     body_start += 4;
@@ -422,14 +455,9 @@ static char* InternalRequest(const char* url, int timeout_ms, const char* auth_t
                     }
                 }
             } else {
-                NetLog("[Net] HTTP 错误状态码: %d", status_code);
+                NetLog("[Net] HTTP 错误: %d (%s)", status_code, u.host);
             }
-        } else {
-            NetLog("[Net] 无效的 HTTP 响应头");
         }
-    } else {
-        if (!buf) NetLog("[Net] 内存分配失败");
-        else if (total_len == 0) NetLog("[Net] 未收到任何数据");
     }
 
 cleanup:
@@ -440,7 +468,6 @@ cleanup:
     return result;
 }
 
-// 通用 HTTP 请求处理
 static char* PerformHttpRequest(const char* url, int timeout_sec, const char* token, const char* proxy) {
     if (s_is_cleaning_up) return NULL;
     
@@ -459,7 +486,7 @@ static char* PerformHttpRequest(const char* url, int timeout_sec, const char* to
         }
 
         if (location[0] != 0) {
-            NetLog("[Net] 跟随重定向 -> %s", location);
+            NetLog("[Net] 重定向 -> %s", location);
             if (strncmp(location, "http", 4) != 0) {
                 if (location[0] == '/') {
                     URL_COMPONENTS_SIMPLE u;
@@ -482,17 +509,14 @@ static char* PerformHttpRequest(const char* url, int timeout_sec, const char* to
     return final_result;
 }
 
-// 接口 1: 普通下载
 char* HttpGet(const char* url, const char* proxy, int timeout_sec) {
     return PerformHttpRequest(url, timeout_sec, NULL, proxy);
 }
 
-// 接口 2: 带 Token 的请求
 char* NetRequest(const char* url, const char* token) {
     return PerformHttpRequest(url, 15, token, NULL);
 }
 
-// 接口 3: 连通性检查
 bool NetCheckConnection(const char* url, const char* proxy, int timeout) {
     char* res = HttpGet(url, proxy, timeout);
     if (res) {
