@@ -180,12 +180,15 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
             hRadTcp = CreateWindowW(L"BUTTON", L"TCP Ping (握手延迟)", WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON, 280, 375, 140, 20, hWnd, (HMENU)ID_RAD_TCP, NULL, NULL);
             SendMessage(hRadSingbox, BM_SETCHECK, BST_CHECKED, 0);
 
-            CreateWindowW(L"STATIC", L"超时(秒):", WS_CHILD | WS_VISIBLE, 25, 405, 60, 20, hWnd, (HMENU)ID_LBL_TIMEOUT, NULL, NULL);
-            hEdtTimeout = CreateWindowW(L"EDIT", L"10", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_NUMBER, 90, 402, 40, 23, hWnd, (HMENU)ID_EDT_TIMEOUT, NULL, NULL);
-            CreateWindowW(L"STATIC", L"并发数:", WS_CHILD | WS_VISIBLE, 150, 405, 50, 20, hWnd, (HMENU)ID_LBL_CONCUR, NULL, NULL);
-            hEdtConcur = CreateWindowW(L"EDIT", L"10", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_NUMBER, 200, 402, 40, 23, hWnd, (HMENU)ID_EDT_CONCUR, NULL, NULL);
-            CreateWindowW(L"STATIC", L"测速地址:", WS_CHILD | WS_VISIBLE, 260, 405, 60, 20, hWnd, (HMENU)ID_LBL_TESTURL, NULL, NULL);
-            hEdtTestUrl = CreateWindowW(L"EDIT", L"https://cp.cloudflare.com/", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL, 325, 402, 465, 23, hWnd, (HMENU)ID_EDT_TESTURL, NULL, NULL);
+            // [修改] 标签改为 (ms)，默认值改为 3000
+            CreateWindowW(L"STATIC", L"超时(ms):", WS_CHILD | WS_VISIBLE, 25, 405, 60, 20, hWnd, (HMENU)ID_LBL_TIMEOUT, NULL, NULL);
+            hEdtTimeout = CreateWindowW(L"EDIT", L"3000", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_NUMBER, 90, 402, 50, 23, hWnd, (HMENU)ID_EDT_TIMEOUT, NULL, NULL);
+
+            CreateWindowW(L"STATIC", L"并发数:", WS_CHILD | WS_VISIBLE, 160, 405, 50, 20, hWnd, (HMENU)ID_LBL_CONCUR, NULL, NULL);
+            hEdtConcur = CreateWindowW(L"EDIT", L"10", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_NUMBER, 210, 402, 40, 23, hWnd, (HMENU)ID_EDT_CONCUR, NULL, NULL);
+            
+            CreateWindowW(L"STATIC", L"测速地址:", WS_CHILD | WS_VISIBLE, 270, 405, 60, 20, hWnd, (HMENU)ID_LBL_TESTURL, NULL, NULL);
+            hEdtTestUrl = CreateWindowW(L"EDIT", L"https://www.google.com", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL, 335, 402, 455, 23, hWnd, (HMENU)ID_EDT_TESTURL, NULL, NULL);
             
             // 5. 执行
             hBtnRun = CreateWindowW(L"BUTTON", L"执行聚合处理 (含测速)", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 25, 435, 765, 30, hWnd, (HMENU)ID_BTN_RUN, NULL, NULL);
