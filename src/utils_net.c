@@ -13,7 +13,7 @@
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <openssl/x509.h>
-#include <openssl/pem.h> // 用于解析内存中的 PEM 证书
+#include <openssl/pem.h>
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "crypt32.lib")
@@ -40,7 +40,6 @@ static volatile BOOL s_is_cleaning_up = FALSE;
 
 // --- [核心功能] 从 EXE 资源段加载证书 ---
 static BOOL LoadCacertFromResource(SSL_CTX* ctx) {
-    // 资源 ID 2 对应 resource.rc 中的: 2 RCDATA "cacert.pem"
     HRSRC hRes = FindResource(NULL, MAKEINTRESOURCE(2), RT_RCDATA);
     if (!hRes) {
         NetLog("[Net] 错误: 未能在 EXE 资源中找到证书 (ID=2)");
@@ -57,7 +56,6 @@ static BOOL LoadCacertFromResource(SSL_CTX* ctx) {
 
     NetLog("[Net] 从 EXE 资源加载证书 (%d bytes)...", size);
 
-    // 创建内存 BIO
     BIO* cbio = BIO_new_mem_buf(pData, size);
     if (!cbio) {
         NetLog("[Net] BIO 创建失败");
@@ -207,7 +205,7 @@ static BOOL InitSSLContext() {
     }
 }
 
-// --- 连接代理逻辑 (修复超时) ---
+// --- 连接代理逻辑 (毫秒级超时) ---
 static SOCKET ConnectWithProxy(const char* host, int port, const char* proxy_url, int timeout_ms) {
     SOCKET s = INVALID_SOCKET;
     struct addrinfo hints = { 0 };
@@ -223,7 +221,7 @@ static SOCKET ConnectWithProxy(const char* host, int port, const char* proxy_url
     if (useProxy) {
         strncpy(targetHost, proxyInfo.host, sizeof(targetHost)-1);
         targetPort = proxyInfo.port;
-        NetLog("[Net] 连接代理: %s:%d -> %s", targetHost, targetPort, host);
+        // NetLog("[Net] 连接代理: %s:%d -> %s", targetHost, targetPort, host); // 减少日志刷屏
     } else {
         strncpy(targetHost, host, sizeof(targetHost)-1);
         targetPort = port;
@@ -244,7 +242,7 @@ static SOCKET ConnectWithProxy(const char* host, int port, const char* proxy_url
         s = socket(ptr->ai_family, ptr->ai_socktype, ptr->ai_protocol);
         if (s == INVALID_SOCKET) continue;
 
-        // [Fix] 直接使用传入的 timeout_ms，不再强制限制 3000ms
+        // [Fix] 设置套接字超时 (毫秒)
         DWORD conn_timeout = (DWORD)timeout_ms; 
         
         setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&conn_timeout, sizeof(conn_timeout));
@@ -258,7 +256,7 @@ static SOCKET ConnectWithProxy(const char* host, int port, const char* proxy_url
     freeaddrinfo(res);
 
     if (s == INVALID_SOCKET) {
-        NetLog("[Net] TCP 连接失败");
+        // NetLog("[Net] TCP 连接失败");
         return INVALID_SOCKET;
     }
 
@@ -271,16 +269,13 @@ static SOCKET ConnectWithProxy(const char* host, int port, const char* proxy_url
             host, port, host, port);
         
         if (send(s, connectReq, (int)strlen(connectReq), 0) <= 0) {
-            NetLog("[Net] 代理握手发送失败");
             closesocket(s);
             return INVALID_SOCKET;
         }
 
-        // 接收代理响应 (受 SO_RCVTIMEO 限制)
         char respBuf[1024];
         int n = recv(s, respBuf, sizeof(respBuf)-1, 0);
         if (n <= 0) {
-            NetLog("[Net] 代理无响应 (超时或断开)");
             closesocket(s);
             return INVALID_SOCKET;
         }
@@ -289,7 +284,7 @@ static SOCKET ConnectWithProxy(const char* host, int port, const char* proxy_url
         if (!strstr(respBuf, " 200 ")) {
             char* crlf = strstr(respBuf, "\r\n");
             if(crlf) *crlf = 0;
-            NetLog("[Net] 代理拒绝: %s", respBuf);
+            NetLog("[Net] 代理握手拒绝: %s", respBuf);
             closesocket(s);
             return INVALID_SOCKET;
         }
@@ -310,7 +305,6 @@ static char* InternalRequest(const char* url, int timeout_ms, const char* auth_t
 
     URL_COMPONENTS_SIMPLE u;
     if (!ParseUrl(url, &u)) {
-        NetLog("[Net] URL 格式错误");
         goto cleanup;
     }
 
@@ -366,7 +360,7 @@ static char* InternalRequest(const char* url, int timeout_ms, const char* auth_t
     while (buf && !s_is_cleaning_up) {
         ULONGLONG now = GetTickCount64();
         if (now - tick_start > (ULONGLONG)timeout_ms) {
-            NetLog("[Net] 下载超时: %s", u.host);
+            // NetLog("[Net] 数据传输超时: %s", u.host);
             break;
         }
 
@@ -448,7 +442,7 @@ static char* InternalRequest(const char* url, int timeout_ms, const char* auth_t
                     }
                 }
             } else {
-                NetLog("[Net] HTTP 错误: %d (%s)", status_code, u.host);
+                // NetLog("[Net] HTTP 错误: %d (%s)", status_code, u.host);
             }
         }
     }
@@ -461,7 +455,8 @@ cleanup:
     return result;
 }
 
-static char* PerformHttpRequest(const char* url, int timeout_sec, const char* token, const char* proxy) {
+// [修改] 参数改为 timeout_ms
+static char* PerformHttpRequest(const char* url, int timeout_ms, const char* token, const char* proxy) {
     if (s_is_cleaning_up) return NULL;
     
     char current_url[MAX_URL_LEN];
@@ -471,7 +466,8 @@ static char* PerformHttpRequest(const char* url, int timeout_sec, const char* to
     int redirects = 0;
     while (redirects < 5 && !s_is_cleaning_up) {
         char location[MAX_URL_LEN] = { 0 };
-        char* result = InternalRequest(current_url, timeout_sec * 1000, token, proxy, location, sizeof(location));
+        // [修改] 传递 timeout_ms，不再乘以 1000
+        char* result = InternalRequest(current_url, timeout_ms, token, proxy, location, sizeof(location));
 
         if (result) {
             final_result = result;
@@ -502,22 +498,25 @@ static char* PerformHttpRequest(const char* url, int timeout_sec, const char* to
     return final_result;
 }
 
-char* HttpGet(const char* url, const char* proxy, int timeout_sec) {
-    return PerformHttpRequest(url, timeout_sec, NULL, proxy);
+// [修改] 参数改为 timeout_ms
+char* HttpGet(const char* url, const char* proxy, int timeout_ms) {
+    if (timeout_ms <= 0) timeout_ms = 15000;
+    return PerformHttpRequest(url, timeout_ms, NULL, proxy);
 }
 
-// 保持兼容性
+// 保持兼容旧接口
 char* NetRequest(const char* url, const char* token) {
-    return PerformHttpRequest(url, 15, token, NULL);
+    return PerformHttpRequest(url, 15000, token, NULL); // 默认 15000ms
 }
 
-// [新增] 支持代理的请求函数
-char* NetRequestWithProxy(const char* url, const char* token, const char* proxy) {
-    return PerformHttpRequest(url, 15, token, proxy);
+// [修改] 参数改为 timeout_ms
+char* NetRequestWithProxy(const char* url, const char* token, const char* proxy, int timeout_ms) {
+    if (timeout_ms <= 0) timeout_ms = 15000;
+    return PerformHttpRequest(url, timeout_ms, token, proxy);
 }
 
-bool NetCheckConnection(const char* url, const char* proxy, int timeout) {
-    char* res = HttpGet(url, proxy, timeout);
+bool NetCheckConnection(const char* url, const char* proxy, int timeout_ms) {
+    char* res = HttpGet(url, proxy, timeout_ms);
     if (res) {
         free(res);
         return true;
