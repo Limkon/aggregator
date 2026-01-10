@@ -1,3 +1,4 @@
+/* src/parser_nodes.c */
 #include "common.h"
 #include "cJSON.h"
 #include "utils_base64.h"
@@ -17,6 +18,28 @@ typedef struct {
     char query[1024];
     char fragment[256];
 } ParsedUrl;
+
+// --- 辅助：修正 URL-Safe Base64 字符串 ---
+// 将 '-'->'+', '_'->'/'，并补齐 '='
+static char* FixUrlSafeBase64(const char* input) {
+    if (!input) return NULL;
+    size_t len = strlen(input);
+    size_t new_len = len + 4; // 预留 padding 空间
+    char* output = (char*)malloc(new_len);
+    if (!output) return NULL;
+
+    strcpy(output, input);
+    for (size_t i = 0; i < len; i++) {
+        if (output[i] == '-') output[i] = '+';
+        else if (output[i] == '_') output[i] = '/';
+    }
+
+    // Padding
+    while (strlen(output) % 4 != 0) {
+        strcat(output, "=");
+    }
+    return output;
+}
 
 // --- 辅助函数：URL 解码 (%xx) ---
 static void UrlDecode(char* dst, const char* src) {
@@ -167,8 +190,12 @@ void ParseNodeBasic(const char* link, ProxyNode* node) {
     // --- VMess ---
     if (strncasecmp(link, "vmess://", 8) == 0) {
         node->type = NODE_VMESS;
-        char* b64 = (char*)link + 8;
-        char* json_str = Base64Decode(b64);
+        char* b64_raw = (char*)link + 8;
+        // [修复] Base64 预处理
+        char* b64_fixed = FixUrlSafeBase64(b64_raw);
+        char* json_str = Base64Decode(b64_fixed ? b64_fixed : b64_raw);
+        if (b64_fixed) free(b64_fixed);
+
         if (json_str) {
             cJSON* root = cJSON_Parse(json_str);
             if (root) {
@@ -229,7 +256,11 @@ void ParseNodeBasic(const char* link, ProxyNode* node) {
                 *tag_ptr = 0; 
             }
             
-            char* decoded = Base64Decode(b64_part);
+            // [修复] 处理 SS Base64
+            char* b64_fixed = FixUrlSafeBase64(b64_part);
+            char* decoded = Base64Decode(b64_fixed ? b64_fixed : b64_part);
+            if (b64_fixed) free(b64_fixed);
+            
             if (tag_ptr) *tag_ptr = '#'; // 恢复
             
             if (decoded) {
@@ -258,8 +289,12 @@ cJSON* GenerateSingboxOutbound(const char* link) {
     
     // ---------------- VMESS ----------------
     if (strncasecmp(link, "vmess://", 8) == 0) {
-        char* b64 = (char*)link + 8;
-        char* json_str = Base64Decode(b64);
+        char* b64_raw = (char*)link + 8;
+        // [修复] Base64 预处理
+        char* b64_fixed = FixUrlSafeBase64(b64_raw);
+        char* json_str = Base64Decode(b64_fixed ? b64_fixed : b64_raw);
+        if (b64_fixed) free(b64_fixed);
+        
         if (!json_str) { cJSON_Delete(outbound); return NULL; }
         
         cJSON* src = cJSON_Parse(json_str);
@@ -276,7 +311,7 @@ cJSON* GenerateSingboxOutbound(const char* link) {
         cJSON* path = cJSON_GetObjectItem(src, "path");
         cJSON* host = cJSON_GetObjectItem(src, "host");
         cJSON* tls = cJSON_GetObjectItem(src, "tls");
-        cJSON* sni = cJSON_GetObjectItem(src, "sni"); // Some vmess links use sni field
+        cJSON* sni = cJSON_GetObjectItem(src, "sni"); 
         
         if (add) cJSON_AddStringToObject(outbound, "server", add->valuestring);
         if (port) {
@@ -318,14 +353,13 @@ cJSON* GenerateSingboxOutbound(const char* link) {
             cJSON* tls_conf = cJSON_CreateObject();
             cJSON_AddBoolToObject(tls_conf, "enabled", cJSON_True);
             
-            // SNI Priority: sni > host > add
             char* server_name = NULL;
             if (sni && sni->valuestring && strlen(sni->valuestring)>0) server_name = sni->valuestring;
             else if (host && host->valuestring && strlen(host->valuestring)>0) server_name = host->valuestring;
             else if (add && add->valuestring) server_name = add->valuestring;
             
             if (server_name) cJSON_AddStringToObject(tls_conf, "server_name", server_name);
-            cJSON_AddBoolToObject(tls_conf, "insecure", cJSON_True); // Default to insecure for scraping
+            cJSON_AddBoolToObject(tls_conf, "insecure", cJSON_True); 
             cJSON_AddItemToObject(outbound, "tls", tls_conf);
         }
 
@@ -343,7 +377,7 @@ cJSON* GenerateSingboxOutbound(const char* link) {
         cJSON_AddNumberToObject(outbound, "server_port", u.port);
         
         if (is_vless) cJSON_AddStringToObject(outbound, "uuid", u.username);
-        else cJSON_AddStringToObject(outbound, "password", u.username); // Trojan password is username
+        else cJSON_AddStringToObject(outbound, "password", u.username); 
 
         // Query Params
         char security[32] = {0}; GetQueryParam(u.query, "security", security, 32);
@@ -422,19 +456,21 @@ cJSON* GenerateSingboxOutbound(const char* link) {
     }
     // ---------------- SS ----------------
     else if (strncasecmp(link, "ss://", 5) == 0) {
-        // 简化处理：仅支持 SIP002 (user:pass@host:port)
-        // Base64 SS 解析太繁琐，暂略，假设由 ParseNodeBasic 预处理或仅支持明文
+        // [修复] 增加对 Base64 SS 的支持，不仅支持 SIP002
         ParsedUrl u;
-        int parsed = 0;
         char* link_to_use = (char*)link;
         char buffer[2048]; // Decode buffer
 
         if (!strchr(link, '@')) {
              // Try base64
-             const char* b64 = link + 5;
-             char* tag = strchr(b64, '#');
+             const char* b64_raw = link + 5;
+             char* tag = strchr(b64_raw, '#');
              if(tag) *tag = 0;
-             char* decoded = Base64Decode(b64);
+             
+             char* b64_fixed = FixUrlSafeBase64(b64_raw);
+             char* decoded = Base64Decode(b64_fixed ? b64_fixed : b64_raw);
+             if (b64_fixed) free(b64_fixed);
+             
              if(tag) *tag = '#';
              
              if(decoded) {
