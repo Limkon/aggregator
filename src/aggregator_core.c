@@ -19,6 +19,17 @@ extern double SpeedTest_Singbox(const char* node_link, int port_index, int timeo
 extern HWND g_hMainWnd; 
 static HANDLE hWorkerThread = NULL;
 
+// --- 线程参数结构体 (移至全局以兼容 MSVC) ---
+typedef void (*TaskCallback)(void* data, int thread_idx);
+
+typedef struct {
+    void* item_ptr;
+    int thread_idx;
+    TaskCallback cb;
+    HANDLE hSem;
+    volatile long* pActive;
+} ThreadArg;
+
 // --- 辅助：重置全局节点列表 ---
 static void ClearGlobalNodes() {
     EnterCriticalSection(&g_dataLock);
@@ -72,61 +83,91 @@ unsigned int __stdcall SearchThreadProc(void* arg) {
 
 // --- 任务 2: 聚合处理线程 ---
 
-typedef void (*TaskCallback)(void* data, int thread_idx);
+// 工作子线程函数
+unsigned int __stdcall WorkerProc(void* p) {
+    ThreadArg* arg = (ThreadArg*)p;
+    
+    // 在开始具体工作前，再次检查是否已中止
+    if (WaitForSingleObject(g_hStopEvent, 0) != WAIT_OBJECT_0) {
+        arg->cb(arg->item_ptr, arg->thread_idx);
+    }
+    
+    // 任务完成，递减活动计数，释放信号量
+    InterlockedDecrement(arg->pActive);
+    ReleaseSemaphore(arg->hSem, 1, NULL);
+    free(arg);
+    return 0;
+}
 
+// 并发任务执行器 (核心修复：解决停止时的死锁)
 static void RunConcurrentTasks(void* items, int count, int item_size, TaskCallback callback, int concurrency) {
     if (count <= 0) return;
     
-    HANDLE* threads = (HANDLE*)malloc(concurrency * sizeof(HANDLE));
+    // 限制最大并发，防止系统卡死
+    if (concurrency < 1) concurrency = 1;
+    if (concurrency > 64) concurrency = 64; 
+    
     HANDLE hSemaphore = CreateSemaphore(NULL, concurrency, concurrency, NULL);
     volatile long active_count = 0;
     
-    typedef struct {
-        void* item_ptr;
-        int thread_idx;
-        TaskCallback cb;
-        HANDLE hSem;
-        volatile long* pActive;
-    } ThreadArg;
-
-    unsigned int __stdcall Worker(void* p) {
-        ThreadArg* arg = (ThreadArg*)p;
-        if (WaitForSingleObject(g_hStopEvent, 0) != WAIT_OBJECT_0) {
-            arg->cb(arg->item_ptr, arg->thread_idx);
-        }
-        InterlockedDecrement(arg->pActive);
-        ReleaseSemaphore(arg->hSem, 1, NULL);
-        free(arg);
-        return 0;
-    }
+    // 等待句柄数组：[0]=停止信号, [1]=资源信号量
+    HANDLE waitHandles[2] = { g_hStopEvent, hSemaphore };
 
     for (int i = 0; i < count; i++) {
-        if (WaitForSingleObject(g_hStopEvent, 0) == WAIT_OBJECT_0) break;
+        // [修复] 使用 WaitForMultipleObjects 同时监听 "停止" 和 "空闲名额"
+        // 只要有一个满足就返回，如果是停止信号，则立即退出循环
+        DWORD waitResult = WaitForMultipleObjects(2, waitHandles, FALSE, INFINITE);
         
-        WaitForSingleObject(hSemaphore, INFINITE);
-        InterlockedIncrement(&active_count);
-        
-        ThreadArg* arg = (ThreadArg*)malloc(sizeof(ThreadArg));
-        arg->item_ptr = (char*)items + (i * item_size);
-        arg->thread_idx = i % concurrency;
-        arg->cb = callback;
-        arg->hSem = hSemaphore;
-        arg->pActive = &active_count;
-        
-        HANDLE hT = (HANDLE)_beginthreadex(NULL, 0, Worker, arg, 0, NULL);
-        if (hT) CloseHandle(hT); 
-        else {
-             InterlockedDecrement(&active_count);
-             ReleaseSemaphore(hSemaphore, 1, NULL);
-             free(arg);
+        if (waitResult == WAIT_OBJECT_0) {
+            // 收到 g_hStopEvent (索引0)，用户点击了中止
+            PostMessage(g_hMainWnd, WM_APP_LOG, 0, (LPARAM)_strdup(">>> 检测到中止信号，停止分发新任务..."));
+            break;
         }
-        
-        if (i % 5 == 0) PostMessage(g_hMainWnd, WM_APP_PROGRESS, i, count);
+        else if (waitResult == WAIT_OBJECT_0 + 1) {
+            // 收到 hSemaphore (索引1)，有空闲线程名额，继续执行
+            InterlockedIncrement(&active_count);
+            
+            ThreadArg* arg = (ThreadArg*)malloc(sizeof(ThreadArg));
+            if (arg) {
+                arg->item_ptr = (char*)items + (i * item_size);
+                arg->thread_idx = i % concurrency;
+                arg->cb = callback;
+                arg->hSem = hSemaphore;
+                arg->pActive = &active_count;
+                
+                HANDLE hT = (HANDLE)_beginthreadex(NULL, 0, WorkerProc, arg, 0, NULL);
+                if (hT) {
+                    CloseHandle(hT); // 线程 detached 运行
+                } else {
+                    // 创建失败回滚
+                    InterlockedDecrement(&active_count);
+                    ReleaseSemaphore(hSemaphore, 1, NULL);
+                    free(arg);
+                }
+            } else {
+                // 内存分配失败回滚
+                InterlockedDecrement(&active_count);
+                ReleaseSemaphore(hSemaphore, 1, NULL);
+            }
+            
+            // 每处理5个任务更新一次进度条或日志，减少界面刷新频率
+            if (i % 5 == 0) PostMessage(g_hMainWnd, WM_APP_PROGRESS, i, count);
+        }
+        else {
+            // 等待失败 (如 WAIT_FAILED)，安全退出
+            break;
+        }
     }
     
-    while (active_count > 0) Sleep(50);
+    // 等待所有正在运行的子任务完成 (Drain)
+    // 注意：这里必须等待，否则释放 hSemaphore 会导致子线程崩溃
+    // 但因为不再分发新任务，这里只会等待最多 1 个超时周期 (如10秒)
+    while (active_count > 0) {
+        Sleep(50);
+        // 可以选择在这里再次 check StopEvent 来强制 kill (不推荐，容易泄露资源)
+    }
+    
     CloseHandle(hSemaphore);
-    free(threads);
 }
 
 // --- 子任务 A: 下载并解析订阅 ---
@@ -168,7 +209,7 @@ void DownloadSubWorker(void* data, int idx) {
         int added = 0;
         int original_len = (int)strlen(content);
 
-        // [修复核心] 智能探测：如果已经是明文，千万不要解码！
+        // 智能探测：如果已经是明文，千万不要解码！
         BOOL is_plaintext = FALSE;
         if (strstr(content, "vmess://") || strstr(content, "ss://") || 
             strstr(content, "trojan://") || strstr(content, "vless://")) {
@@ -242,11 +283,12 @@ void SpeedTestWorker(void* data, int idx) {
 
 // --- 主聚合流程 ---
 unsigned int __stdcall ProcessThreadProc(void* arg) {
+    // 1. 初始化
     ClearGlobalNodes();
-    
     char* input_text = (char*)arg; 
     PostMessage(g_hMainWnd, WM_APP_LOG, 0, (LPARAM)_strdup("=== 开始聚合处理 ==="));
 
+    // 2. 解析输入
     SubLink* sub_links = (SubLink*)malloc(100 * sizeof(SubLink));
     int sub_count = 0;
     
@@ -271,12 +313,14 @@ unsigned int __stdcall ProcessThreadProc(void* arg) {
     snprintf(logBuf, sizeof(logBuf), "直接节点: %d, 订阅链接: %d", g_node_count, sub_count);
     PostMessage(g_hMainWnd, WM_APP_LOG, 0, (LPARAM)_strdup(logBuf));
     
+    // 3. 执行订阅下载 (支持中断)
     if (sub_count > 0) {
         PostMessage(g_hMainWnd, WM_APP_LOG, 0, (LPARAM)_strdup("--- 开始下载订阅 ---"));
         RunConcurrentTasks(sub_links, sub_count, sizeof(SubLink), DownloadSubWorker, g_config.concurrency);
     }
     free(sub_links);
     
+    // 检查是否已中止
     if (WaitForSingleObject(g_hStopEvent, 0) == WAIT_OBJECT_0) goto cleanup;
 
     snprintf(logBuf, sizeof(logBuf), "总节点数: %d", g_node_count);
@@ -287,6 +331,7 @@ unsigned int __stdcall ProcessThreadProc(void* arg) {
         goto cleanup;
     }
 
+    // 4. 执行测速 (支持中断)
     if (g_config.enable_speedtest) {
         char modeStr[64];
         snprintf(modeStr, sizeof(modeStr), "--- 开始测速 (%s, 并发 %d) ---", 
@@ -296,6 +341,9 @@ unsigned int __stdcall ProcessThreadProc(void* arg) {
         
         RunConcurrentTasks(g_nodes, g_node_count, sizeof(ProxyNode), SpeedTestWorker, g_config.concurrency);
         
+        // 再次检查中止，如果中止了就不进行排序和输出了
+        if (WaitForSingleObject(g_hStopEvent, 0) == WAIT_OBJECT_0) goto cleanup;
+
         int NodeCompare(const void* a, const void* b) {
             ProxyNode* na = (ProxyNode*)a;
             ProxyNode* nb = (ProxyNode*)b;
@@ -312,6 +360,7 @@ unsigned int __stdcall ProcessThreadProc(void* arg) {
         PostMessage(g_hMainWnd, WM_APP_LOG, 0, (LPARAM)_strdup(logBuf));
     }
 
+    // 5. 生成结果
     size_t bufSize = g_node_count * (MAX_URL_LEN + 2) + 1024;
     char* fullText = (char*)malloc(bufSize);
     if (fullText) {
@@ -325,6 +374,7 @@ unsigned int __stdcall ProcessThreadProc(void* arg) {
         }
         
         if (strlen(fullText) == 0 && g_node_count > 0) {
+             // 如果测速后全挂了，或者没开测速，至少保留原样
              for (int i = 0; i < g_node_count; i++) {
                 strcat(fullText, g_nodes[i].original_link);
                 strcat(fullText, "\n");
@@ -357,7 +407,10 @@ void StartProcessTask() {
     int maxLen = 1024 * 1024;
     char* buf = (char*)malloc(maxLen);
     extern int GetSubsInputText(char* buffer, int maxLen);
-    GetSubsInputText(buf, maxLen);
+    if (GetSubsInputText(buf, maxLen) <= 0) {
+        // 如果没有内容，放一个空字符串避免野指针
+        buf[0] = '\0';
+    }
     
     hWorkerThread = (HANDLE)_beginthreadex(NULL, 0, ProcessThreadProc, buf, 0, NULL);
 }
