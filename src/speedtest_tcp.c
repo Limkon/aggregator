@@ -1,3 +1,4 @@
+/* src/speedtest_tcp.c */
 #include "common.h"
 #include <stdio.h>
 #include <winsock2.h>
@@ -13,11 +14,12 @@ static double GetTimeMs() {
     return (double)counter.QuadPart * 1000.0 / (double)freq.QuadPart;
 }
 
-// 简单的日志辅助 (需要 aggregator_core.c 暴露或自己实现，这里为了解耦暂不使用)
-// 只要返回 -1.0，上层自然会过滤掉
-
 /**
  * 执行 TCP Ping 测速
+ * @param address       目标地址 (IP 或域名)
+ * @param port          目标端口
+ * @param timeout_ms    超时时间 (毫秒)
+ * @return              延迟毫秒数，失败或超时返回 -1.0
  */
 double SpeedTest_TcpPing(const char* address, int port, int timeout_ms) {
     if (!address || port <= 0 || port > 65535 || strlen(address) == 0) return -1.0;
@@ -27,16 +29,58 @@ double SpeedTest_TcpPing(const char* address, int port, int timeout_ms) {
     SOCKET sock = INVALID_SOCKET;
     double start_time, end_time, latency = -1.0;
 
-    hints.ai_family = AF_UNSPEC;
+    // [优化] 如果地址已经是 IP 字符串，直接使用，跳过 getaddrinfo 的 DNS 查询
+    // 这能极大减少“无反应”的情况，特别是面对大量被污染域名时
+    unsigned long ip_addr = inet_addr(address);
+    if (ip_addr != INADDR_NONE) {
+        // 是 IPv4 地址
+        struct sockaddr_in target;
+        target.sin_family = AF_INET;
+        target.sin_addr.s_addr = ip_addr;
+        target.sin_port = htons(port);
+        
+        sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (sock == INVALID_SOCKET) return -1.0;
+
+        unsigned long on = 1;
+        ioctlsocket(sock, FIONBIO, &on);
+
+        start_time = GetTimeMs();
+        int conn_res = connect(sock, (struct sockaddr*)&target, sizeof(target));
+        
+        // --- 统一的 select 等待逻辑 (IP直连) ---
+        if (conn_res == 0) {
+            end_time = GetTimeMs();
+            latency = end_time - start_time;
+        } else if (WSAGetLastError() == WSAEWOULDBLOCK) {
+            fd_set write_fds, except_fds;
+            FD_ZERO(&write_fds); FD_ZERO(&except_fds);
+            FD_SET(sock, &write_fds); FD_SET(sock, &except_fds);
+            
+            struct timeval tv;
+            tv.tv_sec = timeout_ms / 1000;
+            tv.tv_usec = (timeout_ms % 1000) * 1000;
+
+            if (select(0, NULL, &write_fds, &except_fds, &tv) > 0) {
+                if (FD_ISSET(sock, &write_fds)) {
+                    latency = GetTimeMs() - start_time;
+                }
+            }
+        }
+        closesocket(sock);
+        return latency;
+    }
+
+    // --- 如果不是 IP，必须走 DNS 解析 (可能会慢) ---
+    hints.ai_family = AF_UNSPEC; // IPv4 or IPv6
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_protocol = IPPROTO_TCP;
 
     char port_str[16];
     snprintf(port_str, sizeof(port_str), "%d", port);
 
-    // [注意] getaddrinfo 可能会阻塞。如果 address 是被墙的域名，这里可能卡很久
     if (getaddrinfo(address, port_str, &hints, &res) != 0) {
-        return -1.0; 
+        return -1.0; // 解析失败
     }
 
     struct addrinfo* ptr = NULL;
@@ -49,8 +93,8 @@ double SpeedTest_TcpPing(const char* address, int port, int timeout_ms) {
 
         start_time = GetTimeMs();
 
+        // 发起连接
         if (connect(sock, ptr->ai_addr, (int)ptr->ai_addrlen) == 0) {
-            // 立即连接成功 (极少见)
             end_time = GetTimeMs();
             latency = end_time - start_time;
             closesocket(sock);
@@ -64,35 +108,25 @@ double SpeedTest_TcpPing(const char* address, int port, int timeout_ms) {
         }
 
         fd_set write_fds, except_fds;
-        FD_ZERO(&write_fds);
-        FD_ZERO(&except_fds);
-        FD_SET(sock, &write_fds);
-        FD_SET(sock, &except_fds); // [修复] 监听异常集合
+        FD_ZERO(&write_fds); FD_ZERO(&except_fds);
+        FD_SET(sock, &write_fds); FD_SET(sock, &except_fds);
 
         struct timeval tv;
         tv.tv_sec = timeout_ms / 1000;
         tv.tv_usec = (timeout_ms % 1000) * 1000;
 
-        int sel_res = select(0, NULL, &write_fds, &except_fds, &tv);
-        
-        if (sel_res > 0) {
-            // 检查是否有异常 (连接被拒绝/RST)
-            if (FD_ISSET(sock, &except_fds)) {
-                // 连接失败
-            }
-            else if (FD_ISSET(sock, &write_fds)) {
-                // 可写，进一步检查 SO_ERROR
+        if (select(0, NULL, &write_fds, &except_fds, &tv) > 0) {
+             if (FD_ISSET(sock, &write_fds)) {
+                // 进一步检查 SO_ERROR 确认
                 int error = 0;
                 int len = sizeof(error);
-                if (getsockopt(sock, SOL_SOCKET, SO_ERROR, (char*)&error, &len) == 0) {
-                    if (error == 0) {
-                        end_time = GetTimeMs();
-                        latency = end_time - start_time;
-                        closesocket(sock);
-                        break; // 成功！
-                    }
+                if (getsockopt(sock, SOL_SOCKET, SO_ERROR, (char*)&error, &len) == 0 && error == 0) {
+                    end_time = GetTimeMs();
+                    latency = end_time - start_time;
+                    closesocket(sock);
+                    break; 
                 }
-            }
+             }
         }
 
         closesocket(sock);
