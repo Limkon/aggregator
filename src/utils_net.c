@@ -13,7 +13,7 @@
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <openssl/x509.h>
-#include <openssl/pem.h> // [新增] 用于解析内存中的 PEM 证书
+#include <openssl/pem.h> // 用于解析内存中的 PEM 证书
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "crypt32.lib")
@@ -41,7 +41,6 @@ static volatile BOOL s_is_cleaning_up = FALSE;
 // --- [核心功能] 从 EXE 资源段加载证书 ---
 static BOOL LoadCacertFromResource(SSL_CTX* ctx) {
     // 资源 ID 2 对应 resource.rc 中的: 2 RCDATA "cacert.pem"
-    // RT_RCDATA 是 Windows 标准资源类型
     HRSRC hRes = FindResource(NULL, MAKEINTRESOURCE(2), RT_RCDATA);
     if (!hRes) {
         NetLog("[Net] 错误: 未能在 EXE 资源中找到证书 (ID=2)");
@@ -65,7 +64,6 @@ static BOOL LoadCacertFromResource(SSL_CTX* ctx) {
         return FALSE;
     }
 
-    // 获取 SSL 上下文的证书存储区
     X509_STORE* store = SSL_CTX_get_cert_store(ctx);
     if (!store) {
         BIO_free(cbio);
@@ -75,7 +73,6 @@ static BOOL LoadCacertFromResource(SSL_CTX* ctx) {
     X509* cert = NULL;
     int count = 0;
     
-    // 循环读取所有证书并添加到存储区
     while ((cert = PEM_read_bio_X509(cbio, NULL, 0, NULL)) != NULL) {
         if (X509_STORE_add_cert(store, cert)) {
             count++;
@@ -83,10 +80,8 @@ static BOOL LoadCacertFromResource(SSL_CTX* ctx) {
         X509_free(cert);
     }
     
-    // 获取错误队列中的最后错误，判断是 EOF 还是解析错误
     unsigned long err = ERR_peek_last_error();
     if (ERR_GET_LIB(err) == ERR_LIB_PEM && ERR_GET_REASON(err) == PEM_R_NO_START_LINE) {
-        // 正常的 EOF，清除错误
         ERR_clear_error();
     }
 
@@ -148,7 +143,7 @@ static BOOL ParseUrl(const char* url, URL_COMPONENTS_SIMPLE* out) {
     return TRUE;
 }
 
-// --- 初始化 SSL (更新版) ---
+// --- 初始化 SSL ---
 static BOOL InitSSLContext() {
     if (g_ssl_ctx != NULL) return TRUE;
 
@@ -165,7 +160,6 @@ static BOOL InitSSLContext() {
         if (ctx) {
             BOOL certLoaded = FALSE;
 
-            // 策略 1: 优先尝试加载外部文件 (方便开发调试)
             if (SSL_CTX_load_verify_locations(ctx, "cacert.pem", NULL) == 1) {
                 NetLog("[Net] 加载外部 cacert.pem 成功");
                 certLoaded = TRUE;
@@ -175,14 +169,12 @@ static BOOL InitSSLContext() {
                 certLoaded = TRUE;
             }
 
-            // 策略 2: 如果外部文件不存在，尝试从 EXE 资源加载 (单文件发布)
             if (!certLoaded) {
                 if (LoadCacertFromResource(ctx)) {
                     certLoaded = TRUE;
                 }
             }
 
-            // 最终配置
             if (certLoaded) {
                 SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
             } else {
@@ -215,7 +207,7 @@ static BOOL InitSSLContext() {
     }
 }
 
-// --- 连接代理逻辑 ---
+// --- 连接代理逻辑 (修复超时) ---
 static SOCKET ConnectWithProxy(const char* host, int port, const char* proxy_url, int timeout_ms) {
     SOCKET s = INVALID_SOCKET;
     struct addrinfo hints = { 0 };
@@ -252,7 +244,9 @@ static SOCKET ConnectWithProxy(const char* host, int port, const char* proxy_url
         s = socket(ptr->ai_family, ptr->ai_socktype, ptr->ai_protocol);
         if (s == INVALID_SOCKET) continue;
 
-        DWORD conn_timeout = (timeout_ms > 3000) ? 3000 : timeout_ms;
+        // [Fix] 直接使用传入的 timeout_ms，不再强制限制 3000ms
+        DWORD conn_timeout = (DWORD)timeout_ms; 
+        
         setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&conn_timeout, sizeof(conn_timeout));
         setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&conn_timeout, sizeof(conn_timeout));
 
@@ -282,17 +276,17 @@ static SOCKET ConnectWithProxy(const char* host, int port, const char* proxy_url
             return INVALID_SOCKET;
         }
 
+        // 接收代理响应 (受 SO_RCVTIMEO 限制)
         char respBuf[1024];
         int n = recv(s, respBuf, sizeof(respBuf)-1, 0);
         if (n <= 0) {
-            NetLog("[Net] 代理无响应");
+            NetLog("[Net] 代理无响应 (超时或断开)");
             closesocket(s);
             return INVALID_SOCKET;
         }
         respBuf[n] = 0;
         
         if (!strstr(respBuf, " 200 ")) {
-            // 简单解析首行错误
             char* crlf = strstr(respBuf, "\r\n");
             if(crlf) *crlf = 0;
             NetLog("[Net] 代理拒绝: %s", respBuf);
@@ -329,7 +323,6 @@ static char* InternalRequest(const char* url, int timeout_ms, const char* auth_t
     if (s_is_cleaning_up) goto cleanup;
 
     if (is_https) {
-        // NetLog("[Net] SSL 握手..."); // 减少日志
         ssl = SSL_new(g_ssl_ctx);
         if (!ssl) goto cleanup;
         SSL_set_fd(ssl, (int)s);
