@@ -506,8 +506,14 @@ char* HttpGet(const char* url, const char* proxy, int timeout_sec) {
     return PerformHttpRequest(url, timeout_sec, NULL, proxy);
 }
 
+// 保持兼容性
 char* NetRequest(const char* url, const char* token) {
     return PerformHttpRequest(url, 15, token, NULL);
+}
+
+// [新增] 支持代理的请求函数
+char* NetRequestWithProxy(const char* url, const char* token, const char* proxy) {
+    return PerformHttpRequest(url, 15, token, proxy);
 }
 
 bool NetCheckConnection(const char* url, const char* proxy, int timeout) {
