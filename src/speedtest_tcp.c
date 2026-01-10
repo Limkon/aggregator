@@ -17,10 +17,10 @@ static double GetTimeMs() {
  * 执行 TCP Ping 测速
  * @param address       目标地址 (IP 或域名)
  * @param port          目标端口
- * @param timeout_sec   超时时间 (秒)
+ * @param timeout_ms    超时时间 (毫秒) [修改]
  * @return              延迟毫秒数，失败或超时返回 -1.0
  */
-double SpeedTest_TcpPing(const char* address, int port, int timeout_sec) {
+double SpeedTest_TcpPing(const char* address, int port, int timeout_ms) {
     if (!address || port <= 0 || port > 65535) return -1.0;
 
     struct addrinfo hints = {0};
@@ -76,8 +76,9 @@ double SpeedTest_TcpPing(const char* address, int port, int timeout_sec) {
         FD_SET(sock, &write_fds);
 
         struct timeval tv;
-        tv.tv_sec = timeout_sec;
-        tv.tv_usec = 0;
+        // [修改] 将毫秒转换为 秒 + 微秒
+        tv.tv_sec = timeout_ms / 1000;
+        tv.tv_usec = (timeout_ms % 1000) * 1000;
 
         // select 返回 > 0 表示有事件，socket 可写即表示连接成功
         int sel_res = select(0, NULL, &write_fds, NULL, &tv);
