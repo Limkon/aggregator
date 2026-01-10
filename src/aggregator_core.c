@@ -19,6 +19,15 @@ extern double SpeedTest_Singbox(const char* node_link, int port_index, int timeo
 extern HWND g_hMainWnd; 
 static HANDLE hWorkerThread = NULL;
 
+// --- [核心修复] 任务控制块 (TCB) ---
+// 将同步变量放在堆上，使用引用计数管理生命周期
+// 防止主线程超时退出后，子线程访问失效的栈内存导致崩溃
+typedef struct {
+    HANDLE hSem;                // 信号量
+    volatile long active_count; // 当前正在运行的逻辑任务数
+    volatile long ref_count;    // 内存引用计数 (Main + Workers)
+} TaskControlBlock;
+
 // --- 线程参数结构体 ---
 typedef void (*TaskCallback)(void* data, int thread_idx);
 
@@ -26,8 +35,7 @@ typedef struct {
     void* item_ptr;
     int thread_idx;
     TaskCallback cb;
-    HANDLE hSem;
-    volatile long* pActive;
+    TaskControlBlock* tcb; // 指向共享的控制块
 } ThreadArg;
 
 // --- 辅助：检查是否已中止 ---
@@ -92,29 +100,46 @@ unsigned int __stdcall SearchThreadProc(void* arg) {
 // 工作子线程函数
 unsigned int __stdcall WorkerProc(void* p) {
     ThreadArg* arg = (ThreadArg*)p;
+    TaskControlBlock* tcb = arg->tcb;
     
     // 执行前检查停止信号
     if (WaitForSingleObject(g_hStopEvent, 0) != WAIT_OBJECT_0) {
         arg->cb(arg->item_ptr, arg->thread_idx);
     }
     
-    InterlockedDecrement(arg->pActive);
-    ReleaseSemaphore(arg->hSem, 1, NULL);
+    // 逻辑完成，减少活跃数
+    InterlockedDecrement(&tcb->active_count);
+    // 释放信号量名额
+    ReleaseSemaphore(tcb->hSem, 1, NULL);
+
+    // [核心修复] 减少引用计数，如果是最后一个使用者，负责清理内存
+    // 这样即使主线程已经超时退出了，最后一个结束的子线程也能安全清理资源
+    if (InterlockedDecrement(&tcb->ref_count) == 0) {
+        CloseHandle(tcb->hSem);
+        free(tcb);
+        // PostMessage(g_hMainWnd, WM_APP_LOG, 0, (LPARAM)_strdup("Debug: TCB 延迟释放完成"));
+    }
+
     free(arg);
     return 0;
 }
 
-// 并发任务执行器
+// 并发任务执行器 (修复版)
 static void RunConcurrentTasks(void* items, int count, int item_size, TaskCallback callback, int concurrency) {
     if (count <= 0) return;
     
     if (concurrency < 1) concurrency = 1;
     if (concurrency > 64) concurrency = 64; 
+
+    // 分配 TCB
+    TaskControlBlock* tcb = (TaskControlBlock*)malloc(sizeof(TaskControlBlock));
+    if (!tcb) return;
     
-    HANDLE hSemaphore = CreateSemaphore(NULL, concurrency, concurrency, NULL);
-    volatile long active_count = 0;
+    tcb->hSem = CreateSemaphore(NULL, concurrency, concurrency, NULL);
+    tcb->active_count = 0;
+    tcb->ref_count = 1; // 主线程持有 1 个引用
     
-    HANDLE waitHandles[2] = { g_hStopEvent, hSemaphore };
+    HANDLE waitHandles[2] = { g_hStopEvent, tcb->hSem };
 
     for (int i = 0; i < count; i++) {
         DWORD waitResult = WaitForMultipleObjects(2, waitHandles, FALSE, INFINITE);
@@ -124,26 +149,41 @@ static void RunConcurrentTasks(void* items, int count, int item_size, TaskCallba
             break; 
         }
         else if (waitResult == WAIT_OBJECT_0 + 1) {
-            InterlockedIncrement(&active_count);
+            // 增加引用计数 (为子线程)
+            InterlockedIncrement(&tcb->ref_count);
+            InterlockedIncrement(&tcb->active_count);
             
             ThreadArg* arg = (ThreadArg*)malloc(sizeof(ThreadArg));
             if (arg) {
                 arg->item_ptr = (char*)items + (i * item_size);
                 arg->thread_idx = i % concurrency;
                 arg->cb = callback;
-                arg->hSem = hSemaphore;
-                arg->pActive = &active_count;
+                arg->tcb = tcb; // 传递 TCB
                 
                 HANDLE hT = (HANDLE)_beginthreadex(NULL, 0, WorkerProc, arg, 0, NULL);
                 if (hT) CloseHandle(hT);
                 else {
-                    InterlockedDecrement(&active_count);
-                    ReleaseSemaphore(hSemaphore, 1, NULL);
+                    // 创建失败回滚
+                    InterlockedDecrement(&tcb->active_count);
+                    ReleaseSemaphore(tcb->hSem, 1, NULL);
+                    // 减少刚才加的引用
+                    if (InterlockedDecrement(&tcb->ref_count) == 0) {
+                        CloseHandle(tcb->hSem);
+                        free(tcb);
+                        free(arg);
+                        return; // 极端情况
+                    }
                     free(arg);
                 }
             } else {
-                InterlockedDecrement(&active_count);
-                ReleaseSemaphore(hSemaphore, 1, NULL);
+                // 内存分配失败回滚
+                InterlockedDecrement(&tcb->active_count);
+                ReleaseSemaphore(tcb->hSem, 1, NULL);
+                if (InterlockedDecrement(&tcb->ref_count) == 0) {
+                    CloseHandle(tcb->hSem);
+                    free(tcb);
+                    return;
+                }
             }
             
             if (i % 5 == 0) PostMessage(g_hMainWnd, WM_APP_PROGRESS, i, count);
@@ -153,19 +193,27 @@ static void RunConcurrentTasks(void* items, int count, int item_size, TaskCallba
         }
     }
     
-    // [关键修复] 防止卡死：增加超时等待
-    // 如果子线程卡在 DNS 解析(getaddrinfo)，active_count 不会归零
-    // 我们最多等 3 秒，等不到就强制退出，避免界面无响应
+    // 等待子线程结束
     DWORD start_tick = GetTickCount();
-    while (active_count > 0) {
+    BOOL timeout_occurred = FALSE;
+    
+    while (tcb->active_count > 0) {
+        // [超时保护] 如果等待超过 3000ms，强制断开主线程连接
         if (GetTickCount() - start_tick > 3000) { 
-            PostMessage(g_hMainWnd, WM_APP_LOG, 0, (LPARAM)_strdup(">>> 等待子线程超时，强制结束当前流程..."));
+            PostMessage(g_hMainWnd, WM_APP_LOG, 0, (LPARAM)_strdup(">>> 等待子线程超时，强制断开连接 (后台清理)..."));
+            timeout_occurred = TRUE;
             break; 
         }
         Sleep(50);
     }
     
-    CloseHandle(hSemaphore);
+    // 减少主线程的引用
+    // 如果 timeout_occurred 为真，ref_count 肯定 > 0，这里减少 1 后返回，TCB 留给子线程清理
+    // 如果正常结束，ref_count 此时应为 1 (子线程都退了)，减 1 后为 0，此处清理
+    if (InterlockedDecrement(&tcb->ref_count) == 0) {
+        CloseHandle(tcb->hSem);
+        free(tcb);
+    }
 }
 
 // --- 子任务 A: 下载并解析订阅 ---
@@ -198,11 +246,11 @@ void DownloadSubWorker(void* data, int idx) {
     PostMessage(g_hMainWnd, WM_APP_LOG, 0, (LPARAM)_strdup(logBuf));
     
     const char* proxy = g_config.enable_proxy ? g_config.proxy_url : NULL;
+    // 使用配置的超时
     char* content = HttpGet(link->url, proxy, g_config.timeout);
     
     if (content) {
         int added = 0;
-        int original_len = (int)strlen(content);
         BOOL is_plaintext = FALSE;
         if (strstr(content, "vmess://") || strstr(content, "ss://") || 
             strstr(content, "trojan://") || strstr(content, "vless://")) {
@@ -251,18 +299,33 @@ void DownloadSubWorker(void* data, int idx) {
 // --- 子任务 B: 测速 ---
 void SpeedTestWorker(void* data, int idx) {
     ProxyNode* node = (ProxyNode*)data;
+    char logBuf[512];
+    
     if (node->type == NODE_UNKNOWN && g_config.test_mode == TEST_MODE_TCP) {
         node->latency = -1.0;
         return;
     }
+    
     double lat = -1.0;
+    // 使用节点备注或地址作为标识
+    const char* name = (strlen(node->remark) > 0) ? node->remark : node->address;
+    
     if (g_config.test_mode == TEST_MODE_TCP) {
         lat = SpeedTest_TcpPing(node->address, node->port, g_config.timeout);
     } else {
         lat = SpeedTest_Singbox(node->original_link, idx, g_config.timeout, g_config.test_url);
     }
+    
     node->latency = lat;
     node->is_alive = (lat >= 0);
+
+    // [新增] 详细日志反馈
+    if (lat >= 0) {
+        snprintf(logBuf, sizeof(logBuf), "[测速] %s : %.0f ms", name, lat);
+    } else {
+        snprintf(logBuf, sizeof(logBuf), "[测速] %s : 失败/超时", name);
+    }
+    PostMessage(g_hMainWnd, WM_APP_LOG, 0, (LPARAM)_strdup(logBuf));
 }
 
 // --- 主聚合流程 ---
