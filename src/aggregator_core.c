@@ -19,6 +19,9 @@ extern double SpeedTest_Singbox(const char* node_link, int port_index, int timeo
 extern HWND g_hMainWnd; 
 static HANDLE hWorkerThread = NULL;
 
+// [新增] 定义全局结果缓存，初始化为 NULL
+char* g_full_result_content = NULL;
+
 // --- 任务控制块 (TCB) ---
 // 将同步变量放在堆上，使用引用计数管理生命周期
 typedef struct {
@@ -288,6 +291,7 @@ void DownloadSubWorker(void* data, int idx) {
 }
 
 // --- 子任务 B: 测速 ---
+// [修改] 优化测速 Worker，大幅减少日志量以防 UI 卡顿
 void SpeedTestWorker(void* data, int idx) {
     ProxyNode* node = (ProxyNode*)data;
     char logBuf[512];
@@ -309,16 +313,22 @@ void SpeedTestWorker(void* data, int idx) {
     node->latency = lat;
     node->is_alive = (lat >= 0);
 
+    // [优化] 仅在节点存活时发送日志，避免海量超时日志阻塞 UI 线程
     if (lat >= 0) {
-        snprintf(logBuf, sizeof(logBuf), "[测速] %s : %.0f ms", name, lat);
-    } else {
-        snprintf(logBuf, sizeof(logBuf), "[测速] %s : 失败/超时", name);
-    }
-    PostMessage(g_hMainWnd, WM_APP_LOG, 0, (LPARAM)_strdup(logBuf));
+        snprintf(logBuf, sizeof(logBuf), "[测速 OK] %s : %.0f ms", name, lat);
+        PostMessage(g_hMainWnd, WM_APP_LOG, 0, (LPARAM)_strdup(logBuf));
+    } 
+    // 失败/超时不记录日志，后台默默处理
 }
 
 // --- 主聚合流程 ---
 unsigned int __stdcall ProcessThreadProc(void* arg) {
+    // [新增] 任务开始前，清理旧的全局结果，防止内存残留
+    if (g_full_result_content) {
+        free(g_full_result_content);
+        g_full_result_content = NULL;
+    }
+
     ClearGlobalNodes();
     char* input_text = (char*)arg; 
     PostMessage(g_hMainWnd, WM_APP_LOG, 0, (LPARAM)_strdup("=== 开始聚合处理 ==="));
@@ -422,7 +432,10 @@ unsigned int __stdcall ProcessThreadProc(void* arg) {
         
         char* b64Result = Base64Encode((unsigned char*)fullText, strlen(fullText));
         if (b64Result) {
-            PostMessage(g_hMainWnd, WM_APP_PREVIEW, 0, (LPARAM)b64Result);
+            // [修改] 将结果存入全局缓存，不通过 PostMessage 传递大字符串
+            g_full_result_content = b64Result;
+            // 通知 UI 刷新预览（不带参数）
+            PostMessage(g_hMainWnd, WM_APP_PREVIEW, 0, 0);
         }
         free(fullText);
     }
