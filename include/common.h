@@ -92,4 +92,7 @@ extern HWND g_hMainWnd;               // 主窗口句柄
 // 任务控制
 extern HANDLE g_hStopEvent;           // 用于通知工作线程停止的事件
 
+// [新增] 全局缓存完整的 Base64 结果，用于保存文件，避免 UI 读取卡顿和截断
+extern char* g_full_result_content; 
+
 #endif // COMMON_H
