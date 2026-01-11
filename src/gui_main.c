@@ -1,3 +1,4 @@
+// src/gui_main.c
 // 调整包含顺序：common.h 必须在 gui.h 之前
 #include "common.h"
 #include "gui.h"
@@ -234,16 +235,22 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
                 StopCurrentTask();
             }
             else if (id == ID_BTN_SAVE && code == BN_CLICKED) {
-                int len = GetWindowTextLength(hEdtResult);
-                if (len > 0) {
-                    char* buf = (char*)malloc(len + 1);
-                    if (buf) {
-                        GetWindowTextA(hEdtResult, buf, len + 1);
-                        SaveResultToFile(hWnd, buf);
-                        free(buf);
-                    }
+                // [修改] 优先使用全局缓存保存文件
+                if (g_full_result_content && strlen(g_full_result_content) > 0) {
+                     SaveResultToFile(hWnd, g_full_result_content);
                 } else {
-                    MessageBoxW(hWnd, L"没有内容可保存", L"提示", MB_OK);
+                    // 如果没有全局缓存，说明可能没运行或已清理，尝试从 UI 获取（兼容旧逻辑）
+                    int len = GetWindowTextLength(hEdtResult);
+                    if (len > 0) {
+                        char* buf = (char*)malloc(len + 1);
+                        if (buf) {
+                            GetWindowTextA(hEdtResult, buf, len + 1);
+                            SaveResultToFile(hWnd, buf);
+                            free(buf);
+                        }
+                    } else {
+                        MessageBoxW(hWnd, L"没有内容可保存", L"提示", MB_OK);
+                    }
                 }
             }
         }
@@ -264,9 +271,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
         
     case WM_APP_PREVIEW:
         {
-             char* result = (char*)lParam;
+             // [修改] 读取全局缓存进行预览
+             char* result = g_full_result_content;
              if (result) {
-                 // [优化] 防止大文本卡死
+                 // [优化] 预览界面截断显示，防止 Edit 控件卡死，但保存时会使用完整数据
                  if (strlen(result) > 65535) {
                      char temp[66000];
                      memcpy(temp, result, 65000);
@@ -275,12 +283,17 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
                  } else {
                      SetWindowTextA(hEdtResult, result);
                  }
-                 free(result);
+                 // 注意：此处不再释放 result，因为它是全局缓存 g_full_result_content 的指针
              }
         }
         break;
 
     case WM_DESTROY:
+        // [新增] 退出前清理全局结果缓存
+        if (g_full_result_content) {
+            free(g_full_result_content);
+            g_full_result_content = NULL;
+        }
         if (hFontApp) DeleteObject(hFontApp);
         if (hBrBkg) DeleteObject(hBrBkg);
         PostQuitMessage(0);
@@ -317,7 +330,7 @@ bool CreateMainWindow(HINSTANCE hInstance, int nShow) {
 
     if (!RegisterClassExW(&wcex)) return false;
 
-    g_hMainWnd = CreateWindowW(L"ProxyAggregatorClass", L"代理聚合器 (C语言重构版)", 
+    g_hMainWnd = CreateWindowW(L"ProxyAggregatorClass", L"代理聚合器", 
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
         CW_USEDEFAULT, 0, 850, 920, NULL, NULL, hInstance, NULL);
 
