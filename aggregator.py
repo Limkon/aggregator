@@ -25,9 +25,9 @@ except ImportError:
 
 # 关键词列表：已优化，保留高价值关键词，移除冗余项以节省请求次数
 KEYWORDS: List[str] = [
-    "proxies", "clash", "subscription", "vmess", "vless", 
-    "trojan", "shadowsocks", "hysteria2", "sub", "config", 
-    "v2ray", "ss", "节点", "机场", "翻墙"
+    "proxies", "clash", "subscription", "vmess://", "vless://", 
+    "trojan://", "shadowsocks", "hysteria2", "sub", "config",  "hy://",
+    "v2ray", "ss://", "节点", "机场", "翻墙"
 ]
 
 # 文件后缀：包含 yml 以覆盖更多 Clash 配置
@@ -35,7 +35,7 @@ EXTENSIONS: List[str] = ["yaml", "yml", "txt", "conf", "json"]
 
 MAX_PAGES: int = 5            # 每个关键词搜索的页数
 SEARCH_INTERVAL: float = 3.0  # 搜索请求的基础间隔(秒)，配合重试机制使用
-MAX_EXECUTION_TIME: int = 3600 # 全局最大运行时间 (1小时)
+MAX_EXECUTION_TIME: int = 300 # 全局最大运行时间 (1小时)
 TIMEOUT: int = 10             # 单个文件下载超时时间 (秒)
 DOWNLOAD_WORKERS: int = 10    # 下载线程数 (设置为10以降低并发风控风险)
 
