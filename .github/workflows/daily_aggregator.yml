@@ -81,7 +81,7 @@ jobs:
         retention-days: 1
         overwrite: true
 
-  # --- 第二阶段：测试与清洗 ---
+  # --- 第二阶段：合并、清洗与测试 ---
   check_active:
     needs: fetch_raw
     runs-on: ubuntu-latest
@@ -89,7 +89,6 @@ jobs:
     - name: Checkout Code
       uses: actions/checkout@main
       with:
-        # [关键设置] 需要获取完整的 Git 历史以便后续可以 push 回主分支
         fetch-depth: 0 
 
     - name: Set up Python
@@ -102,58 +101,62 @@ jobs:
       with:
         name: raw-nodes
 
-    # --- [新增] 关键字过滤阶段 ---
-    # 放置在下载工件之后、网络检测之前，利用 filter_nodes.py 剔除黑名单节点，从而大幅降低 check_active 的检测耗时
+    # --- [新增] 合并历史节点 ---
+    - name: Fetch Previous Release Nodes & Merge
+      run: |
+        echo "尝试获取 release 分支上一轮的有效节点..."
+        # 直接通过 raw 链接下载上一轮的结果，如果这是第一次运行报 404 也不影响主流程
+        if wget -qO previous_nodes.txt "https://raw.githubusercontent.com/${{ github.repository }}/release/nodes.txt"; then
+          echo "✅ 成功获取上一轮节点！"
+          if [ -f "merge_nodes.py" ]; then
+            python merge_nodes.py
+            echo "✅ 历史节点与新节点合并去重完成。"
+          else
+            echo "⚠️ 未找到 merge_nodes.py 脚本，跳过合并步骤。"
+          fi
+        else
+          echo "ℹ️ 未找到上一轮节点文件 (可能是首次运行或 release 分支暂无数据)，跳过合并。"
+        fi
+
+    # --- [已存在] 关键字过滤阶段 ---
     - name: Filter Nodes by Keywords
       run: |
         echo "开始执行关键字过滤..."
         if [ -f "filter_nodes.py" ]; then
           python filter_nodes.py
-          
-          # 将过滤后生成的 nodes_filtered.txt 覆盖原始 nodes.txt
-          # 这样后续的 check_active.py 就只会读取和检测安全且合规的节点
           if [ -f "nodes_filtered.txt" ]; then
             mv nodes_filtered.txt nodes.txt
-            echo "✅ 关键字过滤完成，已生成新的 nodes.txt 供后续流程使用。"
+            echo "✅ 关键字过滤完成，已生成最新 nodes.txt"
           fi
         else
           echo "⚠️ 未找到 filter_nodes.py 脚本，跳过关键字过滤阶段。"
         fi
 
-    # --- [核心进化] 下载、检测、自更新代码库 ---
+    # --- 环境安装与测速 ---
     - name: Install Environment & Update GeoIP Database
       run: |
         pip install maxminddb
         
         echo "尝试下载最新的 GeoLite2-Country 数据库..."
-        # 先下载到一个临时文件，防止下载残缺直接覆盖了本地的好文件
         if wget -T 15 -qO temp_GeoLite2.mmdb "https://github.com/P3TERX/GeoLite.mmdb/releases/latest/download/GeoLite2-Country.mmdb"; then
           echo "✅ 成功下载最新的 GeoIP 数据库。"
-          
-          # 替换掉本地的文件
           mv temp_GeoLite2.mmdb GeoLite2-Country.mmdb
           cp GeoLite2-Country.mmdb geoip.mmdb
           
-          # 检查文件是否和当前分支中的版本有区别 (或者第一次添加)
           if [ -n "$(git status --porcelain GeoLite2-Country.mmdb)" ]; then
             echo "发现 GeoIP 数据库存在更新，正在将其同步推送回当前代码分支..."
             git config --local user.email "action@github.com"
             git config --local user.name "GitHub Action"
-            
             git add GeoLite2-Country.mmdb
-            # 加上 [skip ci] 防止这次提交再次触发工作流导致死循环
             git commit -m "Auto-update GeoLite2-Country.mmdb [skip ci]"
-            # 自动推送到触发工作流的当前分支
             git push origin HEAD:${{ github.ref_name }}
             echo "✅ 数据库代码库同步完成！"
           else
             echo "✅ 当前分支的数据库已是最新，无需执行 Git 提交。"
           fi
-          
         else
           echo "⚠️ 下载最新 GeoIP 数据库失败或超时，开始启用本地回退策略！"
-          rm -f temp_GeoLite2.mmdb # 清理可能下载残缺的临时文件
-          
+          rm -f temp_GeoLite2.mmdb
           if [ -f "GeoLite2-Country.mmdb" ]; then
             cp GeoLite2-Country.mmdb geoip.mmdb
             echo "✅ 成功提取当前分支中历史缓存的 GeoLite2-Country.mmdb 用于节点解析。"
