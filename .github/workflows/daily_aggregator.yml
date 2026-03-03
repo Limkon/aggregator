@@ -102,6 +102,24 @@ jobs:
       with:
         name: raw-nodes
 
+    # --- [新增] 关键字过滤阶段 ---
+    # 放置在下载工件之后、网络检测之前，利用 filter_nodes.py 剔除黑名单节点，从而大幅降低 check_active 的检测耗时
+    - name: Filter Nodes by Keywords
+      run: |
+        echo "开始执行关键字过滤..."
+        if [ -f "filter_nodes.py" ]; then
+          python filter_nodes.py
+          
+          # 将过滤后生成的 nodes_filtered.txt 覆盖原始 nodes.txt
+          # 这样后续的 check_active.py 就只会读取和检测安全且合规的节点
+          if [ -f "nodes_filtered.txt" ]; then
+            mv nodes_filtered.txt nodes.txt
+            echo "✅ 关键字过滤完成，已生成新的 nodes.txt 供后续流程使用。"
+          fi
+        else
+          echo "⚠️ 未找到 filter_nodes.py 脚本，跳过关键字过滤阶段。"
+        fi
+
     # --- [核心进化] 下载、检测、自更新代码库 ---
     - name: Install Environment & Update GeoIP Database
       run: |
