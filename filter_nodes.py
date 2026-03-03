@@ -17,6 +17,11 @@ BLACKLIST_KEYWORDS = [
     "流量", 
     "过期",
     "套餐",
+    "vmess",
+    "hy",
+    "pages",
+    "Workers",
+    "reality",
     "群"
 ]
 
